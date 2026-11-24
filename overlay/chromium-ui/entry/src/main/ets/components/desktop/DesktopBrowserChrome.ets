@@ -22,6 +22,7 @@
  *   · 返回键              —— MobileBackRouter（先收弹层，再回退页面历史）。
  */
 import { common } from '@kit.AbilityKit';
+import { display } from '@kit.ArkUI';
 import router from '@ohos.router';
 import {
   AutocompleteItem,
@@ -89,8 +90,11 @@ export struct DesktopBrowserChrome {
   @Prop incognito: boolean = false;
   onCommand: (command: BrowserCommandPayload) => void = (_command: BrowserCommandPayload): void => {};
 
-  // 地址栏编辑态（TextInput 常驻：浏览态显示格式化网址、点击全选进入编辑）。
-  @State private editingAddress: boolean = false;
+  // 地址栏编辑态。与手机同一个 'auraAddressEditing' 键：外壳层靠它在网页
+  // 与 chrome 之间垫一层透明拦截，点地址栏之外就退出编辑（onBlur 对
+  // XComponent 不生效——触摸不走路径上的 ArkUI 焦点体系）。
+  @StorageLink('auraAddressEditing') @Watch('onEditingAddressChanged')
+  private editingAddress: boolean = false;
   @State private addressDraft: string = '';
   @State private addressBase: string = '';
   @State private addressEdited: boolean = false;
@@ -101,6 +105,7 @@ export struct DesktopBrowserChrome {
   private autocompleteSeq: number = 0;
   private autocompletePending: number = -1;
   private addressSuggestTimer: number = -1;
+  private lastActiveTabIndex: number = -1;
   // 弹层开关（bindPopup 锚定各自按钮）。
   @State private menuVisible: boolean = false;
   @State private siteQuickVisible: boolean = false;
@@ -245,6 +250,12 @@ export struct DesktopBrowserChrome {
       urls.push(url);
     }
     requestFavicons(urls, (command: BrowserCommandPayload): void => this.issueCommand(command));
+    // 切了标签还在编辑旧页的地址栏说不通——Chrome 切标签退出 omnibox 编辑。
+    const activeIndex: number = this.browserState?.activeTabIndex ?? -1;
+    if (activeIndex !== this.lastActiveTabIndex) {
+      this.lastActiveTabIndex = activeIndex;
+      this.editingAddress = false;
+    }
     // 换页/换标签时收起与上一页绑定的浮层。
     this.publishInset();
   }
@@ -325,6 +336,18 @@ export struct DesktopBrowserChrome {
     } catch (error) {
     }
     this.editingAddress = false;
+  }
+
+  // 编辑态被外部（AuraShell 的点外侧拦截层）关掉时收尾：收联想、松键盘。
+  private onEditingAddressChanged(): void {
+    if (this.editingAddress) {
+      return;
+    }
+    this.hideAddressSuggest();
+    try {
+      this.addressController.stopEditing();
+    } catch (error) {
+    }
   }
 
   private submitAddress(): void {
@@ -548,6 +571,12 @@ export struct DesktopBrowserChrome {
     if (url.length === 0 || this.isHomeTab()) {
       return;
     }
+    if (this.browserState.bookmarked === true) {
+      // 已收藏 → 摘星（引擎服务命令按 URL 精确删）。
+      this.issueCommand({ command: 'removeBookmarkByUrl', url: url });
+      this.getUIContext().getPromptAction().showToast({ message: '已移出书签', duration: 2000 });
+      return;
+    }
     const title = (this.browserState.title ?? '').trim();
     this.issueCommand({
       command: 'addBookmark',
@@ -717,8 +746,10 @@ export struct DesktopBrowserChrome {
   private TabChip(tab: BrowserTabState, index: number) {
     Stack({ alignContent: Alignment.Center }) {
       Row({ space: 6 }) {
-        if (tab.loading || tab.discarded === true) {
-          // 加载中 / 休眠待载入：小转轮顶替 favicon（Chrome 的 tab spinner）。
+        // 加载中：小转轮顶替 favicon（Chrome 的 tab spinner）。只认「真实
+        // 网址 + 正在加载」——新建的主页标签 discarded=true 但并没在加载，
+        // 拿它当条件会让转轮永远停不下。
+        if (tab.loading === true && !isNewTabUrl(tab.url ?? '')) {
           LoadingProgress()
             .width(16)
             .height(16)
@@ -729,6 +760,8 @@ export struct DesktopBrowserChrome {
             iconData: faviconData(tab.url ?? '', this.favicons),
             iconSize: 16
           })
+            // 休眠标签图标减半透明（Chrome 的 dimmed favicon）。
+            .opacity(tab.discarded === true ? 0.55 : 1)
         }
         Text(this.tabTitle(tab))
           .fontSize(12)
@@ -753,6 +786,19 @@ export struct DesktopBrowserChrome {
       .width('100%')
       .height('100%')
       .padding({ left: 10, right: 8 })
+      // 点整卡切标签：手势直接挂在内容 Row 上（与菜单行同构、不靠跨级
+      // 冒泡——挂在最外 Stack 上时在 Scroll 里实测不触发）。
+      .onClick((): void => {
+        if (tab.active === true) {
+          return;
+        }
+        // 按 id 点名最稳：index 在邻居关闭/挪动后会漂（C++ 侧注释同此约定）。
+        if (tab.id && tab.id.length > 0) {
+          this.issueCommand({ command: 'activateTabById', id: tab.id });
+        } else {
+          this.issueCommand({ command: 'activateTab', index: index });
+        }
+      })
     }
     .width(this.tabChipWidth())
     .height(TAB_CHIP_HEIGHT_VP)
@@ -769,27 +815,9 @@ export struct DesktopBrowserChrome {
     })
     .backgroundColor(tab.active === true ?
       $r('app.color.surface_primary') : $r('app.color.surface_floating'))
+    // 插删不再用 .transition——实测它挂在与手势同级的节点上会把 Scroll 里
+    // 子项的点击整个吞掉；保留 .animation 做宽度和激活配色的平滑过渡。
     .animation({ duration: 160, curve: Curve.FastOutSlowIn })
-    // 插删：新卡自左滑入淡出就位，关卡淡出收窄——和手机端同一组动画曲线。
-    .transition(TransitionEffect.asymmetric(
-      TransitionEffect.opacity(0)
-        .combine(TransitionEffect.translate({ x: -24 }))
-        .animation({ duration: 180, curve: Curve.FastOutSlowIn }),
-      TransitionEffect.opacity(0)
-        .combine(TransitionEffect.scale({ x: 0.6, y: 1 }))
-        .animation({ duration: 140, curve: Curve.Friction })
-    ))
-    .onClick((): void => {
-      if (tab.active === true) {
-        return;
-      }
-      // 按 id 点名最稳：index 在邻居关闭/挪动后会漂（C++ 侧注释同此约定）。
-      if (tab.id && tab.id.length > 0) {
-        this.issueCommand({ command: 'activateTabById', id: tab.id });
-      } else {
-        this.issueCommand({ command: 'activateTab', index: tab.index });
-      }
-    })
   }
 
   // ---- 工具栏 ----
@@ -967,14 +995,15 @@ export struct DesktopBrowserChrome {
             })
         }
 
-        // 收藏星：已收藏画实色（accent）提示状态，未收藏画描边。与手机菜单同一命令。
+        // 收藏星：已收藏画实色（accent）提示状态，未收藏画描边；再点摘星。
         if (!this.editingAddress && !this.isHomeTab()) {
           Image($r('app.media.chromium_bookmark'))
             .width(18)
             .height(18)
             .fillColor(this.browserState.bookmarked === true ?
               $r('app.color.accent_primary') : $r('app.color.icon_secondary'))
-            .accessibilityText(this.browserState.bookmarked === true ? '已收藏，点击编辑书签' : '加入书签')
+            .animation({ duration: 160, curve: Curve.FastOutSlowIn })
+            .accessibilityText(this.browserState.bookmarked === true ? '已收藏，点击移出书签' : '加入书签')
             .onClick((): void => {
               this.toggleBookmark();
             })
@@ -1095,7 +1124,8 @@ export struct DesktopBrowserChrome {
 
   @Builder
   private MenuCard() {
-    Column({ space: 0 }) {
+    Scroll() {
+      Column({ space: 0 }) {
       this.MenuRow($r('app.media.chromium_add'), '新建标签页', '', (): void => {
         this.issueCommand({ command: 'newTab' });
       })
@@ -1189,13 +1219,28 @@ export struct DesktopBrowserChrome {
       this.MenuRow($r('app.media.chromium_settings'), '设置', '', (): void => {
         this.openPanelPage('pages/panels/SettingsPanelPage');
       })
+      }
+      .width(MENU_CARD_WIDTH_VP)
+      .padding({ top: 8, bottom: 8 })
     }
-    .width(MENU_CARD_WIDTH_VP)
-    .padding({ top: 8, bottom: 8 })
+    .scrollBar(BarState.Off)
+    .constraintSize({ maxHeight: this.menuMaxHeightVp() })
     .borderRadius(18)
     .backgroundColor($r('app.color.menu_glass'))
     .shadow({ radius: 26, color: $r('app.color.shadow'), offsetY: 8 })
     .margin({ top: 4 })
+  }
+
+  // 菜单整张约 640vp 高，矮窗装不下会被裁掉底部「设置」：包 Scroll +
+  // 按屏高限高（留工具栏与上下边距），超高即可滚动够到最后一项。
+  private menuMaxHeightVp(): number {
+    try {
+      const heightVp: number =
+        this.getUIContext().px2vp(display.getDefaultDisplaySync().height);
+      return Math.max(280, heightVp - this.topSafeVp - DESKTOP_TOOLBAR_VP - 24);
+    } catch (error) {
+      return 560;
+    }
   }
 
   @Builder

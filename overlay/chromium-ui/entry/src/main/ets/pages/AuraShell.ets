@@ -2124,6 +2124,18 @@ struct AuraShell {
         // sendBrowserControls 的 top 内距压到工具栏之下（与手机同一套
         // setBrowserControls 机制）。放在辅助窗口层之下：引擎弹出的原生
         // 浮窗（扩展 popup 等）仍在最上层。
+        if (this.isDesktopAuraUi() && this.addressEditing) {
+          // 地址栏编辑态：垫一层全窗透明拦截。点网页区（TextInput 的 onBlur
+          // 对 XComponent 不生效）先把编辑态收掉——Chrome 点外侧退出的行为。
+          // 渲染在 DesktopBrowserChrome 之前，z 序在 chrome 之下，不挡工具栏。
+          Row()
+            .width('100%')
+            .height('100%')
+            .backgroundColor(Color.Transparent)
+            .onClick((): void => {
+              this.addressEditing = false;
+            })
+        }
         if (this.isDesktopAuraUi()) {
           DesktopBrowserChrome({
             browserState: this.browserState,
