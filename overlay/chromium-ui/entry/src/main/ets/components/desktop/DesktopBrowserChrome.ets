@@ -23,14 +23,19 @@
  */
 import { common } from '@kit.AbilityKit';
 import { display } from '@kit.ArkUI';
+import { util } from '@kit.ArkTS';
+import { image } from '@kit.ImageKit';
 import router from '@ohos.router';
 import {
   AutocompleteItem,
   BrowserCommandPayload,
   BrowserStateSnapshot,
-  BrowserTabState
+  BrowserTabState,
+  ExtensionActionItem,
+  ShellAnchorRect
 } from 'engine';
 import { AuraSiteIcon } from '../mobile/AuraKit';
+import { ExtIconCache } from '../mobile/ExtIconCache';
 import {
   faviconData,
   hostOf,
@@ -80,6 +85,11 @@ interface FindResultSummary {
   activeMatch?: number;
 }
 
+// 'auraPanelEvent' 变更回音（只取 kind 过滤扩展事件）。
+interface ExtPanelEventPayload {
+  kind?: string;
+}
+
 @Component
 export struct DesktopBrowserChrome {
   @StorageProp('auraTopSafeVp') @Watch('onChromeInsetVarsChanged') topSafeVp: number = 0;
@@ -119,6 +129,32 @@ export struct DesktopBrowserChrome {
   @State private favicons: Map<string, string> = new Map();
   private readonly addressController: TextInputController = new TextInputController();
 
+  // ---- 标签长按拖拽排序 ----
+  private readonly tabScroller: Scroller = new Scroller();
+  @State private dragTabId: string = '';       // 正在拖拽的标签 id（'' = 未拖）
+  @State private dragOffsetX: number = 0;      // 拖拽芯片相对其槽位的横移（vp）
+  private pressAtMs: number = 0;               // 按下时刻（长按阈值判定）
+  private pressWindowX: number = 0;            // 按下点窗口 x（判「滚动抢手势」）
+  private pressTimer: number = -1;             // 长按起拖计时器
+  private dragGrabDelta: number = 0;           // 抓点到芯片左缘的偏移（vp）
+  private dragIndex: number = -1;              // 当前悬停的目标槽位
+  private stripLeftVp: number = 0;             // 标签 Scroll 的窗口 x（vp）
+  private chipSuppressClick: boolean = false;  // 拖拽抬手那拍压住 Button 的 click
+
+  // ---- 扩展（工具栏按钮 + 弹窗）----
+  @StorageLink('auraPanelExtensions') @Watch('onExtensionsPayload') extensionsJson: string = '';
+  @StorageLink('auraPanelEvent') @Watch('onExtPanelEvent') extPanelEventJson: string = '';
+  @State private extItems: ExtensionActionItem[] = [];
+  @State private extFlyoutVisible: boolean = false;
+  private extRequestSeq: number = 0;
+  // 与 ExtensionPanel 同款位图缓存：base64 解成 PixelMap 比直接喂 data: URL 稳。
+  private extIconPixels: Map<string, image.PixelMap> = new Map();
+  private extIconPixelSource: Map<string, string> = new Map();
+  @State private extIconVersion: number = 0;
+  @State private extBrokenIds: string[] = [];
+  // 上报给引擎的按钮锚点全集（'extensions' + 'extension:<id>'），窗口坐标 vp。
+  private extAnchors: Map<string, ShellAnchorRect> = new Map();
+
   aboutToAppear(): void {
     // 返回键：先收弹层（联想/菜单/小锁/查找/编辑态），再回退页面历史；
     // 与 MobileBrowserOverlay 共用同一个 MobileBackRouter 单点注册。
@@ -130,6 +166,13 @@ export struct DesktopBrowserChrome {
     });
     // 首拍同步一次 chrome 高度（aboutToAppear 时 onAreaChange 还没跑）。
     this.publishInset();
+    // 扩展工具栏：先吃 AppStorage 里的旧回包（@Watch 不吃初值），再向引擎要新的。
+    this.onExtensionsPayload();
+    this.requestExtensionActions();
+    const host = this.getUIContext().getHostContext() as common.UIAbilityContext | undefined;
+    ExtIconCache.hydrate(host).then((): void => {
+      this.onExtensionsPayload();
+    });
   }
 
   aboutToDisappear(): void {
@@ -201,6 +244,282 @@ export struct DesktopBrowserChrome {
 
   private secureSite(): boolean {
     return this.currentUrl().startsWith('https://');
+  }
+
+  // ---- 标签长按拖拽排序 ----
+
+  private chipStepVp(): number {
+    return this.tabChipWidth() + 2; // 卡宽 + 行内 space
+  }
+
+  // index 槽位的左缘（窗口 vp）：Scroll 左缘 + 行内 padding 8 + index*step - 滚动偏移。
+  private chipSlotLeft(index: number): number {
+    const scrollX = this.tabScroller.currentOffset()?.xOffset ?? 0;
+    return this.stripLeftVp + 8 + index * this.chipStepVp() - scrollX;
+  }
+
+  // 芯片在 tabs[] 里的实时位次。ForEach 同 key 复用节点时闭包里的 index 会
+  // 旧一拍，拖拽算槽位一律按 id 现查。
+  private liveIndexOf(id: string): number {
+    const list = this.tabs();
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].id === id) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  // 长按 350ms 起拖：芯片浮起跟手，每跨过一个槽位中线就发一次 moveTab——
+  // 引擎即时重排并把新顺序推回来，其他芯片当场让位（Chrome 同款实时重排）。
+  private onChipTouch(event: TouchEvent, tab: BrowserTabState): void {
+    const touch = event.touches.length > 0 ? event.touches[0] : undefined;
+    if (touch === undefined) {
+      return;
+    }
+    const id = tab.id ?? '';
+    if (event.type === TouchType.Down) {
+      // 新一次按压清干净上一轮的拖拽残留（拖拽中芯片被 ForEach 重建、
+      // Up 落在旧节点上时会留下没收尾的 dragTabId）。
+      this.chipSuppressClick = false;
+      this.dragTabId = '';
+      this.dragOffsetX = 0;
+      this.pressAtMs = Date.now();
+      this.pressWindowX = touch.windowX;
+      const liveIndex = this.liveIndexOf(id);
+      this.dragIndex = liveIndex >= 0 ? liveIndex : (tab.index ?? 0);
+      this.dragGrabDelta = touch.windowX - this.chipSlotLeft(this.dragIndex);
+      // 长按即浮起，不等首次移动（「长按它就浮起来」）。计时器到期时若
+      // 芯片已被重建/抬起则不动——抬手或再按时自然收尾。
+      if (this.pressTimer !== -1) {
+        clearTimeout(this.pressTimer);
+      }
+      this.pressTimer = setTimeout((): void => {
+        this.pressTimer = -1;
+        if (id.length === 0 || this.tabs().length < 2) {
+          return;
+        }
+        const indexNow = this.liveIndexOf(id);
+        if (indexNow < 0) {
+          return;
+        }
+        this.dragIndex = indexNow;
+        this.dragTabId = id;
+        this.chipSuppressClick = true;
+        this.dragOffsetX = 0;
+      }, 350);
+      return;
+    }
+    if (event.type === TouchType.Move) {
+      if (id.length === 0 || this.tabs().length < 2) {
+        return;
+      }
+      if (this.dragTabId !== id) {
+        // 长按阈值未到 → 横滑留给 Scroll 自己滚；已明显横移说明滚动抢了
+        // 手势，长按计时器作废（Chrome 同款：滚动赢了就不再起拖）。
+        if (Date.now() - this.pressAtMs < 350) {
+          if (this.pressTimer !== -1 && Math.abs(touch.windowX - this.pressWindowX) > 6) {
+            clearTimeout(this.pressTimer);
+            this.pressTimer = -1;
+          }
+          return;
+        }
+        this.dragTabId = id;
+        this.chipSuppressClick = true;
+        this.dragOffsetX = 0;
+        return;
+      }
+      // 手指下的目标槽位：芯片**左缘**的 scroll-content 坐标 / 槽距四舍五入，
+      // 夹到 [0, n-1]——抓到卡右缘时若按手指算会立刻白跳一格。
+      const scrollX = this.tabScroller.currentOffset()?.xOffset ?? 0;
+      const contentLeft = touch.windowX - this.dragGrabDelta - this.stripLeftVp - 8 + scrollX;
+      const step = this.chipStepVp();
+      const target = Math.max(0, Math.min(this.tabs().length - 1,
+        Math.floor(contentLeft / step + 0.5)));
+      if (target !== this.dragIndex) {
+        this.dragIndex = target;
+        this.issueCommand({ command: 'moveTab', id: id, toIndex: target });
+      }
+      // 芯片左缘贴住抓点：translate = 想要的左缘 - 实际槽位左缘。
+      this.dragOffsetX = (touch.windowX - this.dragGrabDelta) - this.chipSlotLeft(this.dragIndex);
+      return;
+    }
+    if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
+      if (this.pressTimer !== -1) {
+        clearTimeout(this.pressTimer);
+        this.pressTimer = -1;
+      }
+      this.dragTabId = '';
+      this.dragOffsetX = 0;
+      this.dragIndex = -1;
+    }
+  }
+
+  // ---- 扩展（工具栏按钮 + 弹窗）----
+
+  private requestExtensionActions(): void {
+    this.extRequestSeq += 1;
+    this.issueCommand({
+      command: 'getExtensionActions',
+      requestId: this.extRequestSeq,
+      iconSizePx: 96
+    });
+  }
+
+  private onExtensionsPayload(): void {
+    if (this.extensionsJson.length === 0) {
+      return;
+    }
+    try {
+      this.extItems = this.mergeExtIconCache(JSON.parse(this.extensionsJson) as ExtensionActionItem[]);
+      this.decodeExtIcons(this.extItems);
+      this.pruneExtAnchors();
+    } catch (error) {
+    }
+  }
+
+  private onExtPanelEvent(): void {
+    if (this.extPanelEventJson.length === 0) {
+      return;
+    }
+    try {
+      const payload = JSON.parse(this.extPanelEventJson) as ExtPanelEventPayload;
+      if (payload.kind === 'extensionActionsChanged') {
+        this.requestExtensionActions();
+      }
+    } catch (error) {
+    }
+  }
+
+  private pinnedExtItems(): ExtensionActionItem[] {
+    return this.extItems.filter((item: ExtensionActionItem): boolean =>
+      item.pinned && item.userEnabled);
+  }
+
+  private extInitial(name: string): string {
+    const trimmed = name.trim();
+    return trimmed.length > 0 ? trimmed.substring(0, 1).toUpperCase() : '?';
+  }
+
+  private extIconBroken(id: string): boolean {
+    return this.extBrokenIds.indexOf(id) >= 0;
+  }
+
+  // 与 ExtensionPanel 同款：空图标用持久缓存补上，非空的顺手记一笔——
+  // 引擎启停扩展后图标异步重生成，回包常带一段空窗。
+  private mergeExtIconCache(list: ExtensionActionItem[]): ExtensionActionItem[] {
+    const context = this.getUIContext().getHostContext() as common.UIAbilityContext | undefined;
+    return list.map((entry: ExtensionActionItem): ExtensionActionItem => {
+      if (entry.iconPngBase64.length > 0) {
+        ExtIconCache.put(entry.id, entry.iconPngBase64, context);
+        return entry;
+      }
+      const cached = ExtIconCache.get(entry.id);
+      if (cached.length === 0) {
+        return entry;
+      }
+      // 逐字段重建（ArkTS 禁止对象展开）。
+      const patched: ExtensionActionItem = {
+        id: entry.id,
+        name: entry.name,
+        iconPngBase64: cached,
+        badgeText: entry.badgeText,
+        badgeColor: entry.badgeColor,
+        enabled: entry.enabled,
+        pinned: entry.pinned,
+        userEnabled: entry.userEnabled,
+        disableReasons: entry.disableReasons,
+        hasPopup: entry.hasPopup,
+        optionsUrl: entry.optionsUrl,
+        version: entry.version,
+        description: entry.description,
+        author: entry.author
+      };
+      return patched;
+    });
+  }
+
+  private decodeExtIcons(list: ExtensionActionItem[]): void {
+    for (const entry of list) {
+      const raw = entry.iconPngBase64;
+      if (raw.length === 0) {
+        continue;
+      }
+      if (this.extIconPixels.has(entry.id) && this.extIconPixelSource.get(entry.id) === raw) {
+        continue;
+      }
+      this.decodeExtIconOne(entry.id, raw);
+    }
+  }
+
+  private async decodeExtIconOne(id: string, raw: string): Promise<void> {
+    try {
+      const helper = new util.Base64Helper();
+      const bytes = helper.decodeSync(raw.startsWith('data:') ? raw.substring(raw.indexOf(',') + 1) : raw);
+      const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+      const source = image.createImageSource(buffer as ArrayBuffer);
+      const pixel = await source.createPixelMap({
+        desiredPixelFormat: image.PixelMapFormat.RGBA_8888
+      });
+      this.extIconPixels.set(id, pixel);
+      this.extIconPixelSource.set(id, raw);
+      if (this.extIconBroken(id)) {
+        this.extBrokenIds = this.extBrokenIds.filter((entry: string): boolean => entry !== id);
+      }
+      this.extIconVersion += 1;
+    } catch (error) {
+      if (!this.extIconBroken(id)) {
+        this.extBrokenIds = this.extBrokenIds.concat([id]);
+      }
+    }
+  }
+
+  // ---- 扩展锚点上报（setAnchorRects）----
+  // Chromium 的扩展气泡按 id 找锚点：'extensions' = 拼图钮，'extension:<id>' =
+  // 固定到工具栏的那颗钮。窗口坐标 vp；不在集合里的锚点引擎视为没画。
+
+  private reportExtAnchor(id: string, area: Area): void {
+    const rect: ShellAnchorRect = {
+      id: id,
+      x: Math.round(Number(area.globalPosition.x)),
+      y: Math.round(Number(area.globalPosition.y)),
+      width: Math.round(Number(area.width)),
+      height: Math.round(Number(area.height))
+    };
+    const prev = this.extAnchors.get(id);
+    if (prev !== undefined && prev.x === rect.x && prev.y === rect.y &&
+        prev.width === rect.width && prev.height === rect.height) {
+      return;
+    }
+    this.extAnchors.set(id, rect);
+    this.pushExtAnchors();
+  }
+
+  // pinned 集合变化后清掉不再画的 extension:* 锚点（引擎按全集算，缺 = 没画）。
+  private pruneExtAnchors(): void {
+    const live: string[] = ['extensions'];
+    this.pinnedExtItems().forEach((item: ExtensionActionItem): void => {
+      live.push(`extension:${item.id}`);
+    });
+    const dead: string[] = [];
+    this.extAnchors.forEach((_rect: ShellAnchorRect, key: string): void => {
+      if (live.indexOf(key) < 0) {
+        dead.push(key);
+      }
+    });
+    if (dead.length === 0) {
+      return;
+    }
+    dead.forEach((key: string): boolean => this.extAnchors.delete(key));
+    this.pushExtAnchors();
+  }
+
+  private pushExtAnchors(): void {
+    const anchors: ShellAnchorRect[] = [];
+    this.extAnchors.forEach((rect: ShellAnchorRect): void => {
+      anchors.push(rect);
+    });
+    this.issueCommand({ command: 'setAnchorRects', anchors: anchors });
   }
 
   // ---- chrome 高度上报 ----
@@ -758,7 +1077,7 @@ export struct DesktopBrowserChrome {
   @Builder
   private TabStrip() {
     Row({ space: 2 }) {
-      Scroll() {
+      Scroll(this.tabScroller) {
         Row({ space: 2 }) {
           ForEach(this.tabs(), (tab: BrowserTabState, index: number) => {
             this.TabChip(tab, index)
@@ -796,6 +1115,13 @@ export struct DesktopBrowserChrome {
       .layoutWeight(1)
       .height('100%')
       .align(Alignment.Start)
+      .onAreaChange((_oldValue: Area, newValue: Area): void => {
+        // 拖拽换算的基准：Scroll 内容区左缘的窗口 x（vp）。
+        const x = Number(newValue.globalPosition.x);
+        if (Number.isFinite(x)) {
+          this.stripLeftVp = x;
+        }
+      })
     }
     .width('100%')
     .height(this.topSafeVp + DESKTOP_TAB_STRIP_VP)
@@ -848,6 +1174,11 @@ export struct DesktopBrowserChrome {
       .backgroundColor(Color.Transparent)
       .accessibilityText(`${this.tabTitle(tab)}${tab.active === true ? '，当前标签页' : ''}`)
       .onClick((): void => {
+        // 拖拽抬手那拍 Button 仍会派生一次 click——压住，别误激活。
+        if (this.chipSuppressClick) {
+          this.chipSuppressClick = false;
+          return;
+        }
         if (tab.active === true) {
           return;
         }
@@ -867,6 +1198,11 @@ export struct DesktopBrowserChrome {
           .fillColor($r('app.color.icon_secondary'))
           .accessibilityText('关闭标签页')
           .onClick((): void => {
+            // 拖拽落点恰在 × 上时别误关。
+            if (this.chipSuppressClick) {
+              this.chipSuppressClick = false;
+              return;
+            }
             if (tab.id && tab.id.length > 0) {
               this.issueCommand({ command: 'closeTabById', id: tab.id });
             } else {
@@ -897,9 +1233,25 @@ export struct DesktopBrowserChrome {
     // 明显一档）——原来用 surface_floating 只差 8 个色阶，根本分不清。
     .backgroundColor(tab.active === true ?
       $r('app.color.surface_primary') : $r('app.color.surface_secondary'))
+    // 长按拖拽：芯片浮起跟手（上抬的阴影 + 微放大 + 置顶），松手回落。
+    .translate({ x: this.dragTabId === tab.id ? this.dragOffsetX : 0 })
+    .scale(this.dragTabId === tab.id ? { x: 1.04, y: 1.04 } : { x: 1, y: 1 })
+    .shadow(this.dragTabId === tab.id ?
+      { radius: 14, color: '#33000000', offsetX: 0, offsetY: 4 } :
+      { radius: 0, color: Color.Transparent })
+    .zIndex(this.dragTabId === tab.id ? 2 : 0)
+    .onTouch((event?: TouchEvent): void => {
+      if (event !== undefined) {
+        this.onChipTouch(event, tab);
+      }
+    })
     // 插删不再用 .transition——实测它挂在与手势同级的节点上会把 Scroll 里
     // 子项的点击整个吞掉；保留 .animation 做宽度和激活配色的平滑过渡。
-    .animation({ duration: 160, curve: Curve.FastOutSlowIn })
+    // 拖拽中压到 60ms：translate 要紧贴手指，160ms 会拖泥带水。
+    .animation({
+      duration: this.dragTabId === tab.id ? 60 : 160,
+      curve: Curve.FastOutSlowIn
+    })
   }
 
   // ---- 工具栏 ----
@@ -926,6 +1278,41 @@ export struct DesktopBrowserChrome {
       })
 
       this.Omnibox()
+
+      // 固定到工具栏的扩展（Chrome 同款位置）：点了直接跑 action——有 popup
+      // 的扩展由 Chromium 弹自己的气泡，锚到这颗钮上报的矩形。
+      ForEach(this.pinnedExtItems(), (item: ExtensionActionItem) => {
+        this.ExtToolbarButton(item)
+      }, (item: ExtensionActionItem): string =>
+        `${item.id}|${item.badgeText}|${item.enabled === true}|${this.extIconVersion}`)
+
+      // 扩展（拼图钮）：Edge 式小弹窗列出全部扩展，可点可 pin。
+      Button({ type: ButtonType.Circle, stateEffect: true }) {
+        Image($r('app.media.chromium_extensions'))
+          .width(19)
+          .height(19)
+          .fillColor($r('app.color.icon_primary'))
+      }
+      .width(TOOLBAR_BUTTON_VP)
+      .height(TOOLBAR_BUTTON_VP)
+      .backgroundColor(Color.Transparent)
+      .accessibilityText('扩展')
+      .bindPopup(this.extFlyoutVisible, {
+        builder: this.ExtFlyout,
+        placement: Placement.Bottom,
+        popupColor: Color.Transparent,
+        enableArrow: false,
+        onStateChange: (event): void => {
+          this.extFlyoutVisible = event.isVisible;
+        }
+      })
+      .onClick((): void => {
+        this.extFlyoutVisible = !this.extFlyoutVisible;
+      })
+      // 上报窗口坐标锚点：Chromium 的扩展气泡靠它找准按钮位。
+      .onAreaChange((_oldValue: Area, newValue: Area): void => {
+        this.reportExtAnchor('extensions', newValue);
+      })
 
       // 分享当前页。
       Button({ type: ButtonType.Circle, stateEffect: true }) {
@@ -1003,6 +1390,189 @@ export struct DesktopBrowserChrome {
     .enabled(enabled)
     .accessibilityText(label)
     .onClick(action)
+  }
+
+  // ---- 扩展：工具栏钮 + Edge 式弹窗 ----
+
+  // 扩展图标的统一画法：位图 > 字母块（引擎没给图标的扩展），徽标贴右下角。
+  @Builder
+  private ExtIcon(item: ExtensionActionItem, size: number) {
+    Stack({ alignContent: Alignment.BottomEnd }) {
+      if (this.extIconPixels.get(item.id) !== undefined && !this.extIconBroken(item.id)) {
+        Image(this.extIconPixels.get(item.id))
+          .width(size)
+          .height(size)
+          .borderRadius(size * 0.22)
+      } else {
+        Stack() {
+          Text(this.extInitial(item.name))
+            .fontSize(size * 0.5)
+            .fontWeight(FontWeight.Medium)
+            .fontColor('#FFFFFF')
+        }
+        .width(size)
+        .height(size)
+        .borderRadius(size * 0.22)
+        .backgroundColor($r('app.color.icon_secondary'))
+      }
+      if (item.badgeText.length > 0) {
+        Text(item.badgeText)
+          .fontSize(8)
+          .fontColor('#FFFFFF')
+          .padding({ left: 2.5, right: 2.5, top: 1, bottom: 1 })
+          .borderRadius(4)
+          .backgroundColor(item.badgeColor.length > 0 ? item.badgeColor : '#CC333333')
+          .maxLines(1)
+      }
+    }
+    .width(size)
+    .height(size)
+  }
+
+  // 工具栏上的固定扩展钮：点击 = Chromium 工具栏同款 runExtensionAction——
+  // 有 popup 的扩展由引擎开它自己的气泡（锚到本钮上报的 extension:<id> 矩形）。
+  @Builder
+  private ExtToolbarButton(item: ExtensionActionItem) {
+    Button({ type: ButtonType.Circle, stateEffect: true }) {
+      this.ExtIcon(item, 20)
+    }
+    .width(TOOLBAR_BUTTON_VP)
+    .height(TOOLBAR_BUTTON_VP)
+    .backgroundColor(Color.Transparent)
+    .opacity(item.enabled ? 1 : 0.4)
+    .accessibilityText(item.name)
+    .onClick((): void => {
+      this.issueCommand({ command: 'runExtensionAction', id: item.id });
+    })
+    .onAreaChange((_oldValue: Area, newValue: Area): void => {
+      this.reportExtAnchor(`extension:${item.id}`, newValue);
+    })
+  }
+
+  // Edge 式扩展弹窗：窄卡列表，行 = 图标 + 名称 + 简介 + pin；行点击跑 action，
+  // pin 钮切工具栏显隐，底部进完整管理页（复用手机的 ExtensionPanelPage）。
+  @Builder
+  private ExtFlyout() {
+    Column() {
+      Row() {
+        Text('扩展')
+          .fontSize(15)
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.text_primary'))
+      }
+      .width('100%')
+      .padding({ left: 16, right: 16, top: 14, bottom: 10 })
+
+      if (this.extItems.length === 0) {
+        Column() {
+          Text('未安装扩展')
+            .fontSize(13)
+            .fontColor($r('app.color.text_secondary'))
+        }
+        .width('100%')
+        .padding({ top: 20, bottom: 24 })
+      } else {
+        Scroll() {
+          Column({ space: 2 }) {
+            ForEach(this.extItems, (item: ExtensionActionItem) => {
+              this.ExtFlyoutRow(item)
+            }, (item: ExtensionActionItem): string =>
+              `${item.id}|${item.pinned === true}|${item.userEnabled === true}` +
+              `|${item.enabled === true}|${item.badgeText}|${this.extIconVersion}`)
+          }
+          .width('100%')
+          .padding({ left: 6, right: 6 })
+        }
+        .width('100%')
+        .constraintSize({ maxHeight: 360 })
+        .scrollBar(BarState.Auto)
+        .edgeEffect(EdgeEffect.Spring)
+      }
+
+      Divider()
+        .color($r('app.color.divider'))
+        .margin({ top: 6 })
+
+      // 管理入口：复用手机的完整扩展管理页。
+      Row({ space: 12 }) {
+        Image($r('app.media.aura_extensions'))
+          .width(18)
+          .height(18)
+          .fillColor($r('app.color.icon_primary'))
+        Text('管理扩展')
+          .fontSize(13)
+          .fontColor($r('app.color.text_primary'))
+          .layoutWeight(1)
+      }
+      .width('100%')
+      .padding({ left: 16, right: 16, top: 11, bottom: 11 })
+      .borderRadius(8)
+      .hoverEffect(HoverEffect.Highlight)
+      .onClick((): void => {
+        this.extFlyoutVisible = false;
+        this.openPanelPage('pages/panels/ExtensionPanelPage');
+      })
+      .margin({ left: 6, right: 6 })
+    }
+    .width(300)
+    .borderRadius(12)
+    .backgroundColor($r('app.color.surface_floating'))
+    .padding({ bottom: 6 })
+    .shadow({ radius: 24, color: '#33000000', offsetX: 0, offsetY: 6 })
+    // 弹层内容量变化时（扩展装/卸）带上过渡，不硬跳。
+    .animation({ duration: 160, curve: Curve.FastOutSlowIn })
+  }
+
+  // 弹窗单行：图标(32) + 名/简介 + pin 钮。行点击跑 action 并收弹层——有
+  // popup 的扩展气泡由引擎锚到拼图钮（extensions 锚点）开出来。
+  @Builder
+  private ExtFlyoutRow(item: ExtensionActionItem) {
+    Row({ space: 12 }) {
+      this.ExtIcon(item, 32)
+      Column({ space: 2 }) {
+        Text(item.name)
+          .fontSize(14)
+          .fontColor($r('app.color.text_primary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+        Text(!item.userEnabled ? '已停用' : item.description)
+          .fontSize(11)
+          .fontColor($r('app.color.text_secondary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+
+      // pin：填主题色 = 已在工具栏，灰描边 = 可点上去。
+      Button({ type: ButtonType.Circle, stateEffect: true }) {
+        Image($r('app.media.aura_pin'))
+          .width(15)
+          .height(15)
+          .fillColor(item.pinned ? $r('app.color.accent_primary') : $r('app.color.icon_secondary'))
+          .opacity(item.pinned ? 1 : 0.75)
+      }
+      .width(30)
+      .height(30)
+      .backgroundColor(Color.Transparent)
+      .accessibilityText(item.pinned ? '从工具栏取消固定' : '固定到工具栏')
+      .onClick((): void => {
+        this.issueCommand({
+          command: 'setExtensionPinned',
+          id: item.id,
+          pinned: !item.pinned
+        });
+      })
+    }
+    .width('100%')
+    .padding({ left: 10, right: 6, top: 8, bottom: 8 })
+    .borderRadius(8)
+    .opacity(item.userEnabled ? 1 : 0.55)
+    .hoverEffect(HoverEffect.Highlight)
+    .onClick((): void => {
+      this.extFlyoutVisible = false;
+      this.issueCommand({ command: 'runExtensionAction', id: item.id });
+    })
   }
 
   // 地址栏胶囊：锁/站点图标 + 网址（点击进入编辑全选）+ 收藏星。
