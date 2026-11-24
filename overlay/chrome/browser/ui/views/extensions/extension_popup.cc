@@ -223,10 +223,14 @@ void ExtensionPopup::OnWidgetTreeActivated(views::Widget* root_widget,
 gfx::Size ExtensionPopup::GetMinBounds() {
   gfx::Size min_size = kMinSize;
 #if BUILDFLAG(IS_OHOS)
-  // On a phone the popup is the extension's whole surface. A popup that sizes
-  // itself to its content (no explicit width in its page) collapses to a narrow
-  // column, so give it 3/5 of the screen width, capped below GetMaxBounds().
-  if (!GetAnchor().GetIfView() && !GetAnchor().GetIfElement()) {
+  // Only the bottom-centred popup -- a phone, where it is the extension's
+  // whole surface -- needs the wide minimum: one that sizes to its content
+  // (no explicit width in its page) otherwise collapses to a narrow column.
+  // A toolbar-anchored popup (TOP_RIGHT on a tablet's shell chrome) should
+  // hug its content like desktop Chrome; 3/5 of a tablet screen leaves a
+  // mostly-blank bubble.
+  if (views::BubbleBorder::is_arrow_at_center(arrow()) &&
+      !GetAnchor().GetIfView() && !GetAnchor().GetIfElement()) {
     const gfx::Rect work =
         display::Screen::Get()
             ->GetDisplayNearestPoint(GetAnchorRect().CenterPoint())
