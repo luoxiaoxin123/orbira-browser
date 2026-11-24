@@ -2148,7 +2148,9 @@ struct AuraShell {
               this.executeBrowserCommand(command);
             }
           })
-            .align(Alignment.Top)
+            // 顶层 Stack 的 alignContent 是 Bottom，.align 对自定义组件不生效，
+            // chrome 会整列掉到底部——用 position 钉在窗口左上角才稳。
+            .position({ x: 0, y: 0 })
         }
         if (this.auxiliaryWindows.length > 0) {
           this.AuxiliaryWindowLayer()

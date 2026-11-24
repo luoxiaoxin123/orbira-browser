@@ -639,6 +639,7 @@ export struct DesktopBrowserChrome {
         if (this.findVisible) {
           this.FindBar()
         }
+        // if 块整体挂不上 transition，FindBar 自身的根节点带了插删动画。
         // 加载进度条（无加载时为 2px 占位分隔线，高度恒定，视口不跳）。
         // 与手机端同一画法的 Row 宽度动画。
         Stack({ alignContent: Alignment.Start }) {
@@ -680,34 +681,35 @@ export struct DesktopBrowserChrome {
             this.TabChip(tab, index)
           }, (tab: BrowserTabState, index: number): string =>
             (tab.id && tab.id.length > 0) ? tab.id : `${index}:${tab.url}`)
+
+          // 新建标签：Chrome 的「+」跟在最后一个标签后面，标签加宽时一起滑过去。
+          Button({ type: ButtonType.Circle, stateEffect: true }) {
+            Image($r('app.media.chromium_add'))
+              .width(18)
+              .height(18)
+              .fillColor($r('app.color.icon_primary'))
+          }
+          .width(30)
+          .height(30)
+          .backgroundColor(Color.Transparent)
+          .accessibilityText('新建标签页')
+          .onClick((): void => {
+            this.issueCommand({ command: 'newTab' });
+          })
+          .margin({ left: 4 })
         }
-        .padding({ left: 6, right: 2 })
+        .padding({ left: 8, right: 6 })
+        .alignItems(VerticalAlign.Bottom)
       }
       .scrollable(ScrollDirection.Horizontal)
       .scrollBar(BarState.Off)
       .layoutWeight(1)
       .height('100%')
       .align(Alignment.Start)
-
-      // 新建标签：Chrome 的「+」永远贴在标签末尾。
-      Button({ type: ButtonType.Circle, stateEffect: true }) {
-        Image($r('app.media.chromium_add'))
-          .width(18)
-          .height(18)
-          .fillColor($r('app.color.icon_primary'))
-      }
-      .width(30)
-      .height(30)
-      .backgroundColor(Color.Transparent)
-      .accessibilityText('新建标签页')
-      .onClick((): void => {
-        this.issueCommand({ command: 'newTab' });
-      })
-      .margin({ right: 6 })
     }
     .width('100%')
     .height(this.topSafeVp + DESKTOP_TAB_STRIP_VP)
-    .padding({ top: this.topSafeVp, bottom: 4 })
+    .padding({ top: this.topSafeVp })
     .backgroundColor($r('app.color.surface_secondary'))
   }
 
@@ -730,7 +732,8 @@ export struct DesktopBrowserChrome {
         }
         Text(this.tabTitle(tab))
           .fontSize(12)
-          .fontColor($r('app.color.text_primary'))
+          .fontColor(tab.active === true ?
+            $r('app.color.text_primary') : $r('app.color.text_secondary'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .layoutWeight(1)
@@ -753,11 +756,38 @@ export struct DesktopBrowserChrome {
     }
     .width(this.tabChipWidth())
     .height(TAB_CHIP_HEIGHT_VP)
-    .borderRadius({ topLeft: 8, topRight: 8, bottomLeft: 2, bottomRight: 2 })
-    .backgroundColor(tab.active === true ? $r('app.color.surface_primary') : Color.Transparent)
+    .margin({ top: 4 })
+    // Chrome 式：激活卡白底上圆角，与下方工具栏同色连成一片；非激活卡留在
+    // 标签条底色上，用一条描边线把它和底区分开，不再靠纯文字深浅辨认。
+    .borderRadius({ topLeft: 8, topRight: 8, bottomLeft: 0, bottomRight: 0 })
+    .border(tab.active === true ? {
+      width: { left: 1, top: 1, right: 1, bottom: 0 },
+      color: $r('app.color.divider')
+    } : {
+      width: 1,
+      color: $r('app.color.divider')
+    })
+    .backgroundColor(tab.active === true ?
+      $r('app.color.surface_primary') : $r('app.color.surface_floating'))
+    .animation({ duration: 160, curve: Curve.FastOutSlowIn })
+    // 插删：新卡自左滑入淡出就位，关卡淡出收窄——和手机端同一组动画曲线。
+    .transition(TransitionEffect.asymmetric(
+      TransitionEffect.opacity(0)
+        .combine(TransitionEffect.translate({ x: -24 }))
+        .animation({ duration: 180, curve: Curve.FastOutSlowIn }),
+      TransitionEffect.opacity(0)
+        .combine(TransitionEffect.scale({ x: 0.6, y: 1 }))
+        .animation({ duration: 140, curve: Curve.Friction })
+    ))
     .onClick((): void => {
-      if (tab.active !== true) {
-        this.issueCommand({ command: 'activateTab', index: index });
+      if (tab.active === true) {
+        return;
+      }
+      // 按 id 点名最稳：index 在邻居关闭/挪动后会漂（C++ 侧注释同此约定）。
+      if (tab.id && tab.id.length > 0) {
+        this.issueCommand({ command: 'activateTabById', id: tab.id });
+      } else {
+        this.issueCommand({ command: 'activateTab', index: tab.index });
       }
     })
   }
@@ -937,13 +967,14 @@ export struct DesktopBrowserChrome {
             })
         }
 
-        // 收藏星（加入书签，与手机菜单同一命令）。
+        // 收藏星：已收藏画实色（accent）提示状态，未收藏画描边。与手机菜单同一命令。
         if (!this.editingAddress && !this.isHomeTab()) {
           Image($r('app.media.chromium_bookmark'))
             .width(18)
             .height(18)
-            .fillColor($r('app.color.icon_secondary'))
-            .accessibilityText('加入书签')
+            .fillColor(this.browserState.bookmarked === true ?
+              $r('app.color.accent_primary') : $r('app.color.icon_secondary'))
+            .accessibilityText(this.browserState.bookmarked === true ? '已收藏，点击编辑书签' : '加入书签')
             .onClick((): void => {
               this.toggleBookmark();
             })
@@ -1264,5 +1295,12 @@ export struct DesktopBrowserChrome {
     .width('100%')
     .height(DESKTOP_FIND_BAR_VP)
     .backgroundColor($r('app.color.surface_primary'))
+    .transition(TransitionEffect.asymmetric(
+      TransitionEffect.opacity(0)
+        .combine(TransitionEffect.translate({ y: -12 }))
+        .animation({ duration: 160, curve: Curve.FastOutSlowIn }),
+      TransitionEffect.opacity(0)
+        .animation({ duration: 120, curve: Curve.Friction })
+    ))
   }
 }

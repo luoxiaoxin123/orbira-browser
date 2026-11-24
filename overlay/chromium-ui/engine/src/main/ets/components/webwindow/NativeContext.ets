@@ -159,6 +159,9 @@ export interface BrowserStateSnapshot {
   domain: string;
   title: string;
   loading: boolean;
+  // 当前页是否已在书签里（引擎 BookmarkModel 每次状态推送都重算）。
+  // 桌面地址栏的收藏星按它画实/画空；HAR 此前只下发未声明。
+  bookmarked?: boolean;
   canGoBack: boolean;
   canGoForward: boolean;
   // 相邻历史条目的 URL（后退/前进的落点）。壳层只在落点是主页时才铺同色遮盖。
