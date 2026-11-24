@@ -25,6 +25,7 @@ import { IncognitoSwitch, SavedTab } from '../utils/IncognitoSwitch';
 import { WebWindow, PictureInPictureSurface } from 'engine';
 import { MobileBrowserOverlay, TOP_BAR_EXTENT_VP, CHROME_DOCK_EXTENT_VP, CHROME_DOCK_FLOAT_MARGIN_VP, dockCoveredHeightVp } from '../components/mobile/MobileBrowserOverlay';
 import { MobileBackRouter } from '../components/mobile/MobileBackRouter';
+import { DesktopBrowserChrome } from '../components/desktop/DesktopBrowserChrome';
 import { HomeSurface } from '../components/mobile/HomeSurface';
 import { CurrentTabCastSession } from '../components/mobile/CurrentTabCastSession';
 import {
@@ -255,6 +256,11 @@ struct AuraShell {
   // 内距必须换成它——setViewportInsets 是替换式，留着 dock 的值会把键盘 inset
   // 盖掉，页内固定底栏（评论输入条等）会跑到键盘后面被遮。
   @StorageLink('auraKeyboardVp') @Watch('onKeyboardVpChanged') keyboardVpForInset: number = 0;
+  // 桌面 chrome 自报的总高（vp）：DesktopBrowserChrome 挂载、收起页内查找条、
+  // 安全区变化时更新；@Watch 把新 inset 下发给引擎（sendBrowserControls 的
+  // top），让网页视口始终精确落在工具栏之下。
+  @StorageLink('auraDesktopChromeInset') @Watch('onDesktopChromeInsetChanged')
+  private desktopChromeInset: number = 0;
   @StorageLink('auraThemeFontId') themeFontId: string = '';
   @StorageLink('auraThemeFontRevision') themeFontRevision: number = 0;
   @StorageLink('auraOnboardingReady') onboardingReady: boolean = false;
@@ -981,6 +987,24 @@ struct AuraShell {
       });
       return;
     }
+    if (!this.isMobilePhoneUi()) {
+      // 平板/桌面 chrome：常驻、不随滚动收起。top 把网页视口压到工具栏之下，
+      // chrome 自己叠在同区自绘（DesktopBrowserChrome 把实际高度写进
+      // auraDesktopChromeInset，含状态栏余量与可选的页内查找条）。
+      const top: number = Number(AppStorage.get('auraDesktopChromeInset') ?? 0);
+      this.executeBrowserCommand({
+        command: 'setBrowserControls',
+        top: top,
+        minTop: top,
+        bottom: 0
+      });
+      this.executeBrowserCommand({
+        command: 'setBrowserControlsState',
+        state: 'shown',
+        animate: false
+      });
+      return;
+    }
     const topSafe = Number(AppStorage.get('auraTopSafeVp') ?? 0);
     if (this.homeStyle === 'chrome') {
       if (this.dockPosition === 'top') {
@@ -1080,6 +1104,13 @@ struct AuraShell {
     this.applyDockViewportInset();
   }
 
+  private onDesktopChromeInsetChanged(): void {
+    // 无条件重发：桌面挂载时下发新的 top；退回手机时该键被清零，重发走回
+    // 手机分支的几何（同值重发幂等，引擎按值去重）。
+    this.sendBrowserControls();
+    this.applyDockViewportInset();
+  }
+
   private lastTopPushSent: number = -1;
 
   private topBarPushVp(): number {
@@ -1112,6 +1143,16 @@ struct AuraShell {
     }
     const bottomSafe = Number(AppStorage.get('auraBottomSafeVp') ?? 0);
     const topSafe = Number(AppStorage.get('auraTopSafeVp') ?? 0);
+    if (!this.isMobilePhoneUi()) {
+      // 桌面 chrome 没有底部 dock；键盘弹起时底部内距仍要按键盘高让位。
+      const desktopKeyboardVp: number = Number(AppStorage.get('auraKeyboardVp') ?? 0);
+      this.lastTopPushSent = 0;
+      this.executeBrowserCommand({
+        command: 'setViewportInsets',
+        bottom: desktopKeyboardVp > 0 ? desktopKeyboardVp + KEYBOARD_INSET_EXTRA_VP : 0
+      });
+      return;
+    }
     // 与 ratio 事件同步一次标志（幂等）：设置类变更路径直接调用本函数时，
     // 也把标志刷新到当前模式。
     this.topBarHiddenForInset = this.computeTopBarHiddenForInset();
@@ -1989,6 +2030,23 @@ struct AuraShell {
           // 主页层在场时一律不叠：这块盖在主页之上，会叠出整屏蒙白。
           this.NavCoverView()
         }
+        // 平板/桌面主页：同一个 HomeSurface 以嵌入态复用（内容顶距 = chrome
+        // 总高），新标签页时盖住引擎原生 NTP。常驻挂载、Visibility 控制显隐，
+        // 与手机同款（避免回主页时重建 + 重解码壁纸的空帧）。
+        if (this.isDesktopAuraUi()) {
+          HomeSurface({
+            embedded: true,
+            topInsetVp: this.desktopChromeInset,
+            homeVisible: this.isNewTabPage(),
+            incognito: this.incognito,
+            onCommand: (command: BrowserCommandPayload): void => {
+              this.executeBrowserCommand(command);
+            }
+          })
+            .width('100%')
+            .height('100%')
+            .visibility(this.isNewTabPage() ? Visibility.Visible : Visibility.None)
+        }
         if (this.discardedCover) {
           this.DiscardedCoverView()
         }
@@ -2060,6 +2118,37 @@ struct AuraShell {
               this.executeBrowserCommand(command);
             }
           })
+        }
+        // 平板/桌面 chrome（aura_tablet / aura_pc）：标签条+工具栏+地址栏由
+        // DesktopBrowserChrome 自绘，叠在页面之上；网页视口由
+        // sendBrowserControls 的 top 内距压到工具栏之下（与手机同一套
+        // setBrowserControls 机制）。放在辅助窗口层之下：引擎弹出的原生
+        // 浮窗（扩展 popup 等）仍在最上层。
+        if (this.isDesktopAuraUi()) {
+          DesktopBrowserChrome({
+            browserState: this.browserState,
+            incognito: this.incognito,
+            onCommand: (command: BrowserCommandPayload): void => {
+              // 与手机同一约定：返回键先问页面（弹层/全屏页优先处理），
+              // 页面不管才落到标签历史回退。
+              if (command.command === 'back') {
+                this.executeBrowserCommand({
+                  command: 'handleBack', requestId: ++this.backRequestId });
+                return;
+              }
+              // 主页键：尊重「启动页=自定义网址」设置（与手机 overlay 同分支）。
+              if (command.command === 'home') {
+                const startupPage: string = (AppStorage.get('auraStartupPage') as string) ?? 'builtin';
+                const customHome: string = (AppStorage.get('auraHomeUrl') as string) ?? '';
+                if (startupPage === 'homeUrl' && customHome.length > 0) {
+                  this.executeBrowserCommand({ command: 'navigate', url: customHome });
+                  return;
+                }
+              }
+              this.executeBrowserCommand(command);
+            }
+          })
+            .align(Alignment.Top)
         }
         if (this.auxiliaryWindows.length > 0) {
           this.AuxiliaryWindowLayer()

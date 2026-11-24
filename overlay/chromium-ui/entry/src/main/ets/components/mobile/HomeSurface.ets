@@ -297,6 +297,12 @@ export struct HomeSurface {
   // 主页层此刻是否在屏上。状态栏只在壁纸可见时按顶带反色；网页态顶栏是实色，
   // 必须走主题色。与 AuraShell 的 .visibility(homeSurfaceVisible()) 同源同帧。
   @Prop @Watch('onHomeVisibleChanged') homeVisible: boolean = true;
+  // 嵌入模式（平板/桌面 chrome 下方内嵌）：内容顶距换成外层 chrome 总高
+  // （标签条+工具栏+状态栏余量），顶部渐变纱不再画（那一条归 chrome 管），
+  // 壁纸也不再给状态栏反色（标签条是不透明实底，壁纸顶带被它盖住）。
+  @Prop embedded: boolean = false;
+  // 桌面 chrome 总高（vp），由 AuraShell 注入；仅 embedded 时生效。
+  @Prop topInsetVp: number = 0;
   // 状态栏避让由本组件内部承担：surface_primary 背景能铺满状态栏条带。
   @StorageProp('auraTopSafeVp') topSafeVp: number = 0;
   // 底部安全区与风格：简约风格的 dock 悬浮在主页底部、会盖住滚动内容的下沿
@@ -1025,7 +1031,9 @@ export struct HomeSurface {
     // 无痕状态可能变化而 bgUri 不变，补一次下发覆盖这条路径。
     this.publishWallpaperPresence();
     // 网页态（主页层不可见）一律按主题色：顶栏是实色，不跟壁纸走。
-    const useWallpaper: boolean = this.homeVisible && this.bgUri.length > 0 && !this.incognito;
+    // 嵌入态（桌面 chrome 盖住状态栏那一条）同样不看壁纸：标签条是不透明实底。
+    const useWallpaper: boolean = this.homeVisible && !this.embedded &&
+      this.bgUri.length > 0 && !this.incognito;
     // 壁纸未画出/未判色时不下发：此刻画面可能仍是旧网页或偏好还没读回。
     // custom.bgPath 也算「有壁纸」，避免 bgUri 尚未赋值时按主题色抢发。
     const wallpaperPending: boolean = !this.incognito &&
@@ -2575,9 +2583,14 @@ export struct HomeSurface {
   // （设计稿 440×956 实测 21.9%）；Logo 关闭时改为把搜索框中心钉在 33.5%
   // （实测 33.6%）。减去的 24 = 行半高（Logo 行与搜索框都是 48 高）。
   // 「Logo」微调 logoOffset 叠加在锚点之上，负值可上移。
+  // 内容顶距：嵌入态用外层 chrome 总高，独立态用状态栏安全区。
+  private topInset(): number {
+    return this.embedded ? this.topInsetVp : this.topSafeVp;
+  }
+
   private homeTopBlankVp(): number {
     const anchor: number = (this.custom.showLogo || this.incognito) ? 0.22 : 0.335;
-    const anchored: number = this.windowH * anchor - this.topSafeVp - 24 + this.custom.logoOffset;
+    const anchored: number = this.windowH * anchor - this.topInset() - 24 + this.custom.logoOffset;
     // 下限：页面最上面常驻一条 56vp 的工具条（简约风格的主页/标签数/⋮，或
     // Chrome 风格的上置 dock），Blank 再小也不能把首行塞到它下面去 —— 横屏时
     // 窗高只有 ~419vp，算出来的 Blank 本来就只 68vp，一旦 windowH 被读小，
@@ -2590,7 +2603,9 @@ export struct HomeSurface {
   // 不需要让位。顺带让内容能真正超出视口 —— 横屏磁贴少时内容比视口还短，
   // Scroll 的 alwaysEnabled 弹簧只会回弹、停不住。
   private homeBottomBreathVp(): number {
-    const dock: number = this.homeStyle === 'chrome' ? 0 : dockCoveredHeightVp(this.bottomSafeVp);
+    // 嵌入态没有悬浮 dock（桌面 chrome 在顶部），只留基础呼吸位。
+    const dock: number = this.embedded || this.homeStyle === 'chrome' ?
+      0 : dockCoveredHeightVp(this.bottomSafeVp);
     return 24 + dock;
   }
 
@@ -2796,13 +2811,13 @@ export struct HomeSurface {
       }
       .width('100%')
       .height('100%')
-      .padding({ top: this.topSafeVp, left: 24, right: 24 })
+      .padding({ top: this.topInset(), left: 24, right: 24 })
       .backgroundColor(this.bgUri.length > 0 && !this.incognito
         ? Color.Transparent : $r('app.color.surface_primary'))
 
       // 顶部渐变纱幕只在无自定义壁纸时保留：纯色背景滚动时兜住状态栏下的内容。
-      // 有壁纸时让壁纸直接透出状态栏。
-      if (!(this.bgUri.length > 0 && !this.incognito)) {
+      // 有壁纸时让壁纸直接透出状态栏。嵌入态不画——那一条区域归桌面 chrome。
+      if (!this.embedded && !(this.bgUri.length > 0 && !this.incognito)) {
         Column()
           .width('100%')
           .height(this.topSafeVp + 8)
@@ -2866,6 +2881,13 @@ export struct HomeSurface {
       }
       if (Math.abs(w - this.windowW) > 0.5) {
         this.windowW = w;
+        if (this.embedded) {
+          // 嵌入态（桌面 chrome 下 / 自由窗）：display 是整机物理高，不能用它
+          // 算锚点（自由窗里它比窗口本身高得多）——用本组件实测高再扣掉 chrome
+          // 高，锚点落在 chrome 之下的内容区（Chrome 的 NTP 锚点也按内容区算）。
+          this.windowH = Math.max(0, h - this.topInsetVp);
+          return;
+        }
         let screenH: number = 0;
         try {
           const dsp = display.getDefaultDisplaySync();
@@ -2876,8 +2898,10 @@ export struct HomeSurface {
         this.windowH = screenH > 0 ? screenH : h;
         return;
       }
-      if (h > this.windowH + 0.5) {
-        this.windowH = h;
+      // 嵌入态这条也要扣 chrome 高：windowH 的语义是「chrome 之下的内容区高」。
+      const contentH: number = this.embedded ? Math.max(0, h - this.topInsetVp) : h;
+      if (contentH > this.windowH + 0.5) {
+        this.windowH = contentH;
       }
     })
   }
