@@ -4294,7 +4294,10 @@ export struct MobileBrowserOverlay {
     // （它本来就不在名单里，引擎按 everywhere 对所有 http(s) 页返回桌面）。
     // 真正让单页回到移动版的是这份例外名单：引擎 IsDesktopSiteHost() 里优先判定，
     // 外壳 WebWindow 导航前也按它拦住桌面 UA 注入。
-    const allSites: boolean = String(AppStorage.get('auraUaDefault') ?? 'mobile') === 'desktop';
+    // 派生键：平板/桌面家族形态默认桌面版时也算「全局开着」，单站「回到移动版」
+    // 才写进例外名单（AuraShell.refreshUaDefaultEffective 发布）。
+    const allSites: boolean = String(AppStorage.get('auraUaDefaultEffective') ??
+      AppStorage.get('auraUaDefault') ?? 'mobile') === 'desktop';
     const mobileList: string[] = ShellUiPrefs.parseUrlList(
       String(AppStorage.get('auraMobileSites') ?? ''));
     const mobileIdx: number = mobileList.indexOf(host);

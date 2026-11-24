@@ -426,6 +426,9 @@ struct AuraShell {
       // 供 WebWindow 在导航前推导桌面 UA、设置面板展示/管理。
       ShellUiPrefs.loadDesktopSites(context).then((list: string[]): void => {
         AppStorage.setOrCreate('auraDesktopSites', ShellUiPrefs.joinUrlList(list));
+        // 名单就绪标记：refreshUaDefaultEffective 的即时重推以它为闸，
+        // 避免偏好未加载完时拿空名单把引擎侧的 host 表冲掉。
+        this.desktopPrefsReady = true;
       });
       // 单站「回到移动版」例外名单：与桌面站名单同路持久化，启动期灌进 AppStorage，
       // 供 WebWindow 导航前推导 UA、菜单切换时增删。
@@ -434,6 +437,12 @@ struct AuraShell {
       });
       ShellUiPrefs.loadUaDefault(context).then((value: string): void => {
         AppStorage.setOrCreate('auraUaDefault', value);
+        this.refreshUaDefaultEffective();
+      });
+      // 读者是否亲手设置过全局 UA 默认：false 时平板/桌面家族按形态默认桌面版。
+      ShellUiPrefs.loadUaDefaultSet(context).then((value: boolean): void => {
+        AppStorage.setOrCreate('auraUaDefaultSet', value);
+        this.refreshUaDefaultEffective();
       });
     }
     // 冷启动预热（见 navCover 注释）。
@@ -1864,6 +1873,8 @@ struct AuraShell {
           const prevUrl: string = this.browserState.url;
           const prevTabIndex: number = this.browserState.activeTabIndex ?? -1;
           this.browserState = state;
+          // uiFamily 可能在这次状态里翻转（旋转/自由窗），重算派生默认 UA。
+          this.refreshUaDefaultEffective();
           // 换页/换标签：解除上一页的顶栏常显档，别把「关了隐藏开关」带到新页。
           // @Watch 会把内距、dock 与 browser controls 整套重算回 1.1.9。
           const pageChanged: boolean = (state.url ?? '') !== prevUrl ||
@@ -3335,6 +3346,46 @@ struct AuraShell {
 
   private desktopSitesSynced: boolean = false;
 
+  // 「全局默认桌面版」的派生开关：读者在设置里亲手设过（auraUaDefaultSet）
+  // 就以 'auraUaDefault' 为准；没设过时平板/桌面家族（uiFamily =
+  // aura_tablet/aura_pc，横屏大窗）按形态默认桌面版，手机家族默认手机版。
+  // 结果发布到 'auraUaDefaultEffective'，WebWindow 导航注入、菜单切换、
+  // 设置页展示都读它而不是原始 pref——单一推导点。
+  @StorageLink('auraUaDefault') @Watch('refreshUaDefaultEffective')
+  private uaDefaultPref: string = 'mobile';
+  @StorageLink('auraUaDefaultSet') @Watch('refreshUaDefaultEffective')
+  private uaDefaultSet: boolean = false;
+
+  private uaDefaultIsDesktop(): boolean {
+    if (this.uaDefaultSet) {
+      return this.uaDefaultPref === 'desktop';
+    }
+    const family: string = this.browserState.uiFamily ?? '';
+    return this.uaDefaultPref === 'desktop' ||
+      family === 'aura_tablet' || family === 'aura_pc';
+  }
+
+  // 名单偏好是否已从 disk 读出（刷新重推只在此后置行，否则等 syncDesktopSites）。
+  private desktopPrefsReady: boolean = false;
+
+  private refreshUaDefaultEffective(): void {
+    const next: string = this.uaDefaultIsDesktop() ? 'desktop' : 'mobile';
+    if (String(AppStorage.get('auraUaDefaultEffective') ?? '') === next) {
+      return;
+    }
+    AppStorage.setOrCreate('auraUaDefaultEffective', next);
+    // 全局档翻转立刻推给引擎：everywhere 标志不进下次导航不生效，旋转/自由窗
+    // 切换时不能等下一跳。名单偏好没读完先只发键，让 syncDesktopSites 兜底。
+    if (this.desktopPrefsReady) {
+      this.executeBrowserCommand({
+        command: 'setDesktopSites',
+        sites: String(AppStorage.get('auraDesktopSites') ?? ''),
+        allSites: next === 'desktop',
+        mobileSites: String(AppStorage.get('auraMobileSites') ?? '')
+      });
+    }
+  }
+
   private syncDesktopSites(): void {
     // 只在启动时跑一轮：onBrowserState 每次状态更新都会进 ready 分支，
     // 不加闸门会不断重排重试，形成命令洪水（页面反复加载、脚本卡死）。
@@ -3344,8 +3395,7 @@ struct AuraShell {
       return;
     }
     const sites: string = String(AppStorage.get('auraDesktopSites') ?? '');
-    const allSites: boolean =
-      String(AppStorage.get('auraUaDefault') ?? 'mobile') === 'desktop';
+    const allSites: boolean = this.uaDefaultIsDesktop();
     // 不在这里 return：名单是异步从 preferences 读进来的，第一次调用时可能还是
     // 空的。始终留着重试，等它读出来再送一次。
     if (sites.length > 0 || allSites) {

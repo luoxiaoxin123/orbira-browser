@@ -43,6 +43,9 @@ const KEY_DESKTOP_SITES = 'desktopSites';
 const KEY_MOBILE_SITES = 'mobileSites';
 // 全局默认 UA：'mobile'（默认，手机浏览体验）或 'desktop'（所有站点用桌面 UA）。
 const KEY_UA_DEFAULT = 'uaDefault';
+// 读者是否在设置里亲手碰过「默认使用桌面版网站」开关：false 时平板/桌面家族
+// 按形态默认桌面版；true 后以用户选择为准（平板横屏也能明确关回手机默认）。
+const KEY_UA_DEFAULT_SET = 'uaDefaultSet';
 // 冷启动时标签徽标的初值：上次退出时的标签数。会话恢复期间徽标冻结在这个值上，
 // 免得从 0 一路数到实际数量。用同步 API，保证首帧就能拿到。
 const KEY_LAST_TAB_COUNT = 'lastTabCount';
@@ -376,6 +379,25 @@ export class ShellUiPrefs {
     try {
       const store = await preferences.getPreferences(context, STORE_NAME);
       await store.put(KEY_UA_DEFAULT, value === 'desktop' ? 'desktop' : 'mobile');
+      await store.flush();
+    } catch (error) {
+    }
+  }
+
+  // 读者是否亲手设置过全局 UA 默认（见 KEY_UA_DEFAULT_SET）。
+  static async loadUaDefaultSet(context: common.Context): Promise<boolean> {
+    try {
+      const store = await preferences.getPreferences(context, STORE_NAME);
+      return Boolean(await store.get(KEY_UA_DEFAULT_SET, false));
+    } catch (error) {
+      return false;
+    }
+  }
+
+  static async saveUaDefaultSet(context: common.Context, value: boolean): Promise<void> {
+    try {
+      const store = await preferences.getPreferences(context, STORE_NAME);
+      await store.put(KEY_UA_DEFAULT_SET, value);
       await store.flush();
     } catch (error) {
     }

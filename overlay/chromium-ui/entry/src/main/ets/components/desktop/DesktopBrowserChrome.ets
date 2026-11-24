@@ -44,6 +44,7 @@ import { MobileBackRouter } from '../mobile/MobileBackRouter';
 import { BrowserCommandBus } from '../../bus/BrowserCommandBus';
 import { isNewTabUrl } from '../../utils/NewTabUrl';
 import { IncognitoSwitch, SavedTab } from '../../utils/IncognitoSwitch';
+import { ShellUiPrefs } from '../../utils/appearance/ShellUiPrefs';
 
 // 视觉常量（vp）。工具栏总高 = 标签条 + 工具行 + 进度条，AuraShell 的
 // setBrowserControls top 用它把网页视口压到 chrome 之下。
@@ -591,10 +592,63 @@ export struct DesktopBrowserChrome {
       return;
     }
     const enabled = !(this.browserState.requestDesktopSite === true);
+    this.persistDesktopSite(enabled);
     this.issueCommand({ command: 'setRequestDesktopSite', enabled: enabled });
     this.getUIContext().getPromptAction().showToast({
       message: enabled ? '已请求桌面版网站' : '已回到移动版网站',
       duration: 2000
+    });
+  }
+
+  // 将当前标签的 host 加入或移出桌面版名单，并落盘 + 同步 AppStorage（与
+  // MobileBrowserOverlay.persistDesktopSite 同一套协议：WebWindow 据此在下次
+  // 导航前自动下发桌面 UA）。「全局默认桌面版」生效时（含平板/桌面家族按形态
+  // 默认）改用移动例外名单，让单站能真正切回手机版。
+  private persistDesktopSite(enabled: boolean): void {
+    const url: string = this.browserState?.url ?? '';
+    const host: string = hostOf(url);
+    if (host.length === 0) {
+      return;
+    }
+    const context = this.getUIContext().getHostContext() as common.UIAbilityContext | undefined;
+    const raw = String(AppStorage.get('auraDesktopSites') ?? '');
+    const list: string[] = ShellUiPrefs.parseUrlList(raw);
+    const idx: number = list.indexOf(host);
+    if (enabled) {
+      if (idx < 0) {
+        list.push(host);
+      }
+    } else if (idx >= 0) {
+      list.splice(idx, 1);
+    }
+    const joined: string = ShellUiPrefs.joinUrlList(list);
+    AppStorage.setOrCreate('auraDesktopSites', joined);
+    if (context) {
+      ShellUiPrefs.saveDesktopSites(context, list);
+    }
+    const allSites: boolean = String(AppStorage.get('auraUaDefaultEffective') ??
+      AppStorage.get('auraUaDefault') ?? 'mobile') === 'desktop';
+    const mobileList: string[] = ShellUiPrefs.parseUrlList(
+      String(AppStorage.get('auraMobileSites') ?? ''));
+    const mobileIdx: number = mobileList.indexOf(host);
+    if (!enabled && allSites) {
+      if (mobileIdx < 0) {
+        mobileList.push(host);
+      }
+    } else if (mobileIdx >= 0) {
+      mobileList.splice(mobileIdx, 1);
+    }
+    const mobileJoined: string = ShellUiPrefs.joinUrlList(mobileList);
+    AppStorage.setOrCreate('auraMobileSites', mobileJoined);
+    if (context) {
+      ShellUiPrefs.saveMobileSites(context, mobileList);
+    }
+    // 同步给引擎：引擎按这份名单在每次导航时决定 UA，脚本后台新开的标签也靠它。
+    this.issueCommand({
+      command: 'setDesktopSites',
+      sites: joined,
+      allSites: allSites,
+      mobileSites: mobileJoined
     });
   }
 
@@ -1229,8 +1283,10 @@ export struct DesktopBrowserChrome {
       })
       if (!this.isHomeTab()) {
         this.MenuRow($r('app.media.aura_desktop'),
-          this.browserState.requestDesktopSite === true ? '移动版网站' : '桌面版网站', '',
-          (): void => {
+          // 文案=当前模式而非目标：已是桌面版就显示「桌面版网站」，
+          // 手机版显示「手机版网站」，右侧提示点击可切换。
+          this.browserState.requestDesktopSite === true ? '桌面版网站' : '手机版网站',
+          '切换', (): void => {
             this.toggleDesktopSite();
           })
         this.MenuRow($r('app.media.chromium_bookmark'), '加入书签', '', (): void => {

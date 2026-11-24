@@ -1558,7 +1558,10 @@ export struct WebWindow {
         }
       }
     }
-    const def = String(AppStorage.get('auraUaDefault') ?? 'mobile');
+    // 派生键优先：平板/桌面家族在读者没亲手设过开关时按形态默认桌面版
+    // （AuraShell.refreshUaDefaultEffective 发布，见 auraUaDefaultSet）。
+    const def = String(AppStorage.get('auraUaDefaultEffective') ??
+      AppStorage.get('auraUaDefault') ?? 'mobile');
     if (def === 'desktop') {
       return true;
     }
@@ -1690,7 +1693,8 @@ export struct WebWindow {
           out.push({
             command: 'setDesktopSites',
             sites: String(AppStorage.get('auraDesktopSites') ?? ''),
-            allSites: String(AppStorage.get('auraUaDefault') ?? 'mobile') === 'desktop',
+            allSites: String(AppStorage.get('auraUaDefaultEffective') ??
+              AppStorage.get('auraUaDefault') ?? 'mobile') === 'desktop',
             mobileSites: String(AppStorage.get('auraMobileSites') ?? '')
           });
         }
