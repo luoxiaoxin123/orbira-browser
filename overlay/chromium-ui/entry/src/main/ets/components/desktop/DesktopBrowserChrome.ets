@@ -709,7 +709,14 @@ export struct DesktopBrowserChrome {
           ForEach(this.tabs(), (tab: BrowserTabState, index: number) => {
             this.TabChip(tab, index)
           }, (tab: BrowserTabState, index: number): string =>
-            (tab.id && tab.id.length > 0) ? tab.id : `${index}:${tab.url}`)
+            // ArkUI 的 ForEach 对相同 key 直接复用旧节点、不重跑
+            // itemGenerator——只把稳定的 id/index 编进 key，芯片会一直渲染
+            // 捕获时的旧快照（标题停在「新标签页」、激活色落在旧卡上），
+            // 连点击闭包里的 tab 都是旧的。可变字段全部进 key，任何
+            // 一项变了就整卡重建，渲染与手势拿到的都是当下状态。
+            `${(tab.id && tab.id.length > 0) ? tab.id : `idx${index}`}` +
+            `|${tab.url}|${tab.title}|${tab.active === true}` +
+            `|${tab.loading === true}|${tab.discarded === true}`)
 
           // 新建标签：Chrome 的「+」跟在最后一个标签后面，标签加宽时一起滑过去。
           Button({ type: ButtonType.Circle, stateEffect: true }) {
@@ -745,31 +752,61 @@ export struct DesktopBrowserChrome {
   @Builder
   private TabChip(tab: BrowserTabState, index: number) {
     Stack({ alignContent: Alignment.Center }) {
-      Row({ space: 6 }) {
-        // 加载中：小转轮顶替 favicon（Chrome 的 tab spinner）。只认「真实
-        // 网址 + 正在加载」——新建的主页标签 discarded=true 但并没在加载，
-        // 拿它当条件会让转轮永远停不下。
-        if (tab.loading === true && !isNewTabUrl(tab.url ?? '')) {
-          LoadingProgress()
-            .width(16)
-            .height(16)
-            .color($r('app.color.icon_secondary'))
-        } else {
-          AuraSiteIcon({
-            url: tab.url ?? '',
-            iconData: faviconData(tab.url ?? '', this.favicons),
-            iconSize: 16
-          })
-            // 休眠标签图标减半透明（Chrome 的 dimmed favicon）。
-            .opacity(tab.discarded === true ? 0.55 : 1)
+      // 激活手势挂在 Button 上：实测 Scroll+ForEach 里中间层 Row/Stack 的
+      // onClick 与子手势共存时整卡不响应，而 ×、+ 这类「叶子控件手势」
+      // 一直好使——整卡干脆就是一个 Button。
+      Button({ type: ButtonType.Normal, stateEffect: true }) {
+        Row({ space: 6 }) {
+          // 加载中：小转轮顶替 favicon（Chrome 的 tab spinner）。只认「真实
+          // 网址 + 正在加载」——新建的主页标签 discarded=true 但并没在加载，
+          // 拿它当条件会让转轮永远停不下。
+          if (tab.loading === true && !isNewTabUrl(tab.url ?? '')) {
+            LoadingProgress()
+              .width(16)
+              .height(16)
+              .color($r('app.color.icon_secondary'))
+          } else {
+            AuraSiteIcon({
+              url: tab.url ?? '',
+              iconData: faviconData(tab.url ?? '', this.favicons),
+              iconSize: 16
+            })
+              // 休眠标签图标减半透明（Chrome 的 dimmed favicon）。
+              .opacity(tab.discarded === true ? 0.55 : 1)
+          }
+          Text(this.tabTitle(tab))
+            .fontSize(12)
+            .fontColor(tab.active === true ?
+              $r('app.color.text_primary') : $r('app.color.text_secondary'))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .layoutWeight(1)
         }
-        Text(this.tabTitle(tab))
-          .fontSize(12)
-          .fontColor(tab.active === true ?
-            $r('app.color.text_primary') : $r('app.color.text_secondary'))
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .layoutWeight(1)
+        .width('100%')
+        .padding({ left: 10, right: 28 })
+        // 让命中直接落在 Button 自身——内容 Row 不再参与命中。
+        .hitTestBehavior(HitTestMode.None)
+      }
+      .width('100%')
+      .height('100%')
+      .padding(0)
+      .borderRadius({ topLeft: 8, topRight: 8, bottomLeft: 0, bottomRight: 0 })
+      .backgroundColor(Color.Transparent)
+      .accessibilityText(`${this.tabTitle(tab)}${tab.active === true ? '，当前标签页' : ''}`)
+      .onClick((): void => {
+        if (tab.active === true) {
+          return;
+        }
+        // 按 id 点名最稳：index 在邻居关闭/挪动后会漂（C++ 侧注释同此约定）。
+        if (tab.id && tab.id.length > 0) {
+          this.issueCommand({ command: 'activateTabById', id: tab.id });
+        } else {
+          this.issueCommand({ command: 'activateTab', index: index });
+        }
+      })
+      // × 是 Button 右侧叠放的兄弟节点：包装 Row 自己透明于命中
+      // （Transparent），× 仍可独立点中，其余区域全部落给激活 Button。
+      Row() {
         Image($r('app.media.aura_close'))
           .width(16)
           .height(16)
@@ -784,21 +821,9 @@ export struct DesktopBrowserChrome {
           })
       }
       .width('100%')
-      .height('100%')
-      .padding({ left: 10, right: 8 })
-      // 点整卡切标签：手势直接挂在内容 Row 上（与菜单行同构、不靠跨级
-      // 冒泡——挂在最外 Stack 上时在 Scroll 里实测不触发）。
-      .onClick((): void => {
-        if (tab.active === true) {
-          return;
-        }
-        // 按 id 点名最稳：index 在邻居关闭/挪动后会漂（C++ 侧注释同此约定）。
-        if (tab.id && tab.id.length > 0) {
-          this.issueCommand({ command: 'activateTabById', id: tab.id });
-        } else {
-          this.issueCommand({ command: 'activateTab', index: index });
-        }
-      })
+      .justifyContent(FlexAlign.End)
+      .padding({ right: 8 })
+      .hitTestBehavior(HitTestMode.Transparent)
     }
     .width(this.tabChipWidth())
     .height(TAB_CHIP_HEIGHT_VP)
@@ -813,8 +838,11 @@ export struct DesktopBrowserChrome {
       width: 1,
       color: $r('app.color.divider')
     })
+    // Chrome 式：激活卡纯白，与下方工具栏（同为 surface_primary）连成一片
+    // 浮出来；非激活卡吃标签条底色（surface_secondary，#F2F3F5 与白底差出
+    // 明显一档）——原来用 surface_floating 只差 8 个色阶，根本分不清。
     .backgroundColor(tab.active === true ?
-      $r('app.color.surface_primary') : $r('app.color.surface_floating'))
+      $r('app.color.surface_primary') : $r('app.color.surface_secondary'))
     // 插删不再用 .transition——实测它挂在与手势同级的节点上会把 Scroll 里
     // 子项的点击整个吞掉；保留 .animation 做宽度和激活配色的平滑过渡。
     .animation({ duration: 160, curve: Curve.FastOutSlowIn })
