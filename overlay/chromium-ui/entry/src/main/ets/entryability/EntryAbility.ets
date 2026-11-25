@@ -610,6 +610,8 @@ export default class EntryAbility extends UIAbility {
   private captureWindowState(win: window.Window): WindowStateSnapshot {
     let inFreeWindowMode = false;
     let windowStatus = 0;
+    let windowWidthVp = 0;
+    let windowHeightVp = 0;
 
     try {
       inFreeWindowMode = !!win.isInFreeWindowMode();
@@ -621,9 +623,22 @@ export default class EntryAbility extends UIAbility {
     } catch (error) {
     }
 
+    // 应用窗口自身的 vp 尺寸：设备路由靠它分「平板横屏/大自由窗 = 桌面 UI」
+    // 与「竖屏/竖屏比例小窗 = 手机 UI」。windowRect 是 px，用窗口自己的
+    // UIContext 折 vp（跟随窗口所在屏的密度，不取主屏兜底值）。
+    try {
+      const rect = win.getWindowProperties().windowRect;
+      const uiContext = win.getUIContext();
+      windowWidthVp = Math.round(uiContext.px2vp(rect.width));
+      windowHeightVp = Math.round(uiContext.px2vp(rect.height));
+    } catch (error) {
+    }
+
     return {
       inFreeWindowMode,
-      windowStatus
+      windowStatus,
+      windowWidthVp,
+      windowHeightVp
     };
   }
 

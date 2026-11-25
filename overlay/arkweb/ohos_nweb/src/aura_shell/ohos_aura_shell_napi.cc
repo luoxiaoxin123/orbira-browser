@@ -823,6 +823,46 @@ void NativeDispatchMouseEvent(OH_NativeXComponent* component, void* window) {
   if (action < 0) {
     return;
   }
+
+  // HarmonyOS delivers stylus contact through the mouse channel. A pen drag
+  // dispatched as a mouse drag scrolls without any fling and stops the moment
+  // the pen lifts, so reroute it through the touch path, which reaches the
+  // same gesture detector a finger does.
+  OH_NativeXComponent_TouchPointToolType mouse_tool =
+      OH_NATIVEXCOMPONENT_TOOL_TYPE_UNKNOWN;
+  OH_NativeXComponent_GetTouchPointToolType(component, 0, &mouse_tool);
+  if (mouse_tool == OH_NATIVEXCOMPONENT_TOOL_TYPE_PEN) {
+    int touch_action = -1;
+    switch (action) {
+      case 0:   // press
+      case 1:   // release
+      case 2:   // move keep their values on the touch enum too.
+        touch_action = action;
+        break;
+      case 13:  // cancel
+        touch_action = 3;
+        break;
+      default:
+        break;
+    }
+    HostPtr pen_host = FindHost(*component_id);
+    if (touch_action >= 0 && pen_host) {
+      if (touch_action == 0) {
+        pen_host->OnFocusChanged(true);
+      }
+      pen_host->DispatchNativeTouchEvent(
+          {.action = touch_action,
+           .pointer_id = 0,
+           .x = mouse_event.x,
+           .y = mouse_event.y,
+           .root_x = mouse_event.screenX,
+           .root_y = mouse_event.screenY,
+           .timestamp_ns = mouse_event.timestamp,
+           .target_widget = GetComponentEventTarget(*component_id)});
+    }
+    return;
+  }
+
   if (action == 0 || action == 1) {
     WVLOG_W(
         "AuraShell native mouse action=%{public}d button=%{public}d "

@@ -66,6 +66,11 @@ export interface DeviceIdentity {
 export interface WindowStateSnapshot {
   inFreeWindowMode: boolean;
   windowStatus: number;
+  // 应用窗口自身尺寸（vp）。设备路由按它区分「平板横屏/大自由窗 = 桌面 UI」
+  // 与「平板竖屏/竖屏比例小窗 = 手机 UI」——display.* 是整机分辨率，分屏/自由
+  // 窗下应用只占其中一部分，必须用 windowRect 才行。
+  windowWidthVp?: number;
+  windowHeightVp?: number;
 }
 
 export interface DeviceRoutingContext {
@@ -229,6 +234,10 @@ const TV_MARKET_KEYWORDS: string[] = [
 const MATEPAD_KEYWORDS: string[] = [ 'MATEPAD' ];
 const MATEBOOK_KEYWORDS: string[] = [ 'MATEBOOK' ];
 
+// 桌面 chrome（标签条+工具栏）放得下需要的最小窗口宽度，对应华为响应式断点
+// md（600vp）：比它窄时桌面标签条不可用，回手机单栏布局。
+const DESKTOP_CHROME_MIN_WIDTH_VP: number = 600;
+
 function normalizeText(value: string): string {
   return (value ?? '').trim().toUpperCase();
 }
@@ -257,8 +266,8 @@ export class DeviceRoutingPolicy {
 
   static resolveFromIdentity(identity: DeviceIdentity, windowState?: WindowStateSnapshot): DeviceRouting {
     const deviceClass = DeviceRoutingPolicy.resolveDeviceClass(identity);
-    const uiProfile = DeviceRoutingPolicy.resolveUiProfile(identity);
-    const uiFamily = DeviceRoutingPolicy.resolveUiFamily(identity, deviceClass, uiProfile);
+    const uiProfile = DeviceRoutingPolicy.resolveUiProfile(identity, windowState);
+    const uiFamily = DeviceRoutingPolicy.resolveUiFamily(identity, deviceClass, uiProfile, windowState);
     const inputProfile = DeviceRoutingPolicy.resolveInputProfile(deviceClass, uiProfile);
     const windowPolicy = DeviceRoutingPolicy.resolveWindowPolicy(identity, windowState);
 
@@ -417,52 +426,67 @@ export class DeviceRoutingPolicy {
     return source.foldStatus !== folded;
   }
 
-  private static resolveUiProfile(identity: DeviceIdentity): UIProfile {
+  private static resolveUiProfile(identity: DeviceIdentity, windowState?: WindowStateSnapshot): UIProfile {
     if (DeviceRoutingPolicy.isMateBook(identity) || identity.deviceType === '2in1' || identity.deviceType === 'desktop') {
       return UIProfile.PC;
-    }
-
-    if (DeviceRoutingPolicy.isMatePad(identity)) {
-      return UIProfile.TABLET;
     }
 
     if (DeviceRoutingPolicy.isTv(identity) || DeviceRoutingPolicy.isCar(identity)) {
       return UIProfile.TABLET;
     }
 
-    if (DeviceRoutingPolicy.isExpandedFold(identity)) {
-      return UIProfile.TABLET;
-    }
-
-    if (identity.deviceType === 'phone') {
-      return UIProfile.PHONE;
-    }
-
-    if (identity.deviceType === 'tablet') {
-      return UIProfile.TABLET;
+    // 平板形态（MatePad / tablet / 展开态折叠屏）按窗口形状分流：
+    // 横屏或够宽的自由窗给桌面布局，竖屏或竖屏比例小窗回手机 UI。
+    if (DeviceRoutingPolicy.isMatePad(identity) || identity.deviceType === 'tablet' ||
+      DeviceRoutingPolicy.isExpandedFold(identity)) {
+      return DeviceRoutingPolicy.isCompactWindow(windowState) ? UIProfile.PHONE : UIProfile.TABLET;
     }
 
     return UIProfile.PHONE;
   }
 
-  private static resolveUiFamily(identity: DeviceIdentity, deviceClass: DeviceClass, uiProfile: UIProfile): UIFamily {
+  private static resolveUiFamily(identity: DeviceIdentity, deviceClass: DeviceClass,
+    uiProfile: UIProfile, windowState?: WindowStateSnapshot): UIFamily {
     if (uiProfile === UIProfile.PC || deviceClass === DeviceClass.TWO_IN_ONE) {
       return UIFamily.AURA_PC;
     }
 
-    if (deviceClass === DeviceClass.TV || deviceClass === DeviceClass.CAR || DeviceRoutingPolicy.isExpandedFold(identity)) {
+    if (deviceClass === DeviceClass.TV || deviceClass === DeviceClass.CAR) {
       return UIFamily.MOBILE_LARGE;
     }
 
-    if (DeviceRoutingPolicy.isMatePad(identity) || identity.deviceType === 'tablet') {
-      return UIFamily.AURA_TABLET;
+    // 与 resolveUiProfile 同一条规则：紧凑窗口下整套路成手机 UI，uiFamily 也
+    // 要落到 mobile_phone（UA、触点交互、外壳分工都跟它走）。
+    if (DeviceRoutingPolicy.isExpandedFold(identity)) {
+      // 展开态接近方形：横屏比例给大屏桌面 UI，竖屏比例回手机 UI。
+      return DeviceRoutingPolicy.isCompactWindow(windowState) ? UIFamily.MOBILE_PHONE : UIFamily.AURA_TABLET;
     }
 
-    if (deviceClass === DeviceClass.FOLDABLE && !DeviceRoutingPolicy.isExpandedFold(identity)) {
+    if (DeviceRoutingPolicy.isMatePad(identity) || identity.deviceType === 'tablet') {
+      return DeviceRoutingPolicy.isCompactWindow(windowState) ? UIFamily.MOBILE_PHONE : UIFamily.AURA_TABLET;
+    }
+
+    if (deviceClass === DeviceClass.FOLDABLE) {
       return UIFamily.MOBILE_PHONE;
     }
 
     return identity.deviceType === 'phone' ? UIFamily.MOBILE_PHONE : UIFamily.AURA_TABLET;
+  }
+
+  // 「紧凑窗口」判定：平板/展开折叠屏上区分桌面 UI 与手机 UI 的唯一依据。
+  //   · 竖屏或竖屏比例（高 ≥ 宽）→ 紧凑 → 手机 UI；
+  //   · 横屏但宽度不足 600vp（分屏窄条/小自由窗）→ 紧凑 → 手机 UI；
+  //   · 尺寸未知 → 非紧凑（保持这些设备既有的大屏默认）。
+  private static isCompactWindow(windowState?: WindowStateSnapshot): boolean {
+    if (!windowState) {
+      return false;
+    }
+    const width = windowState.windowWidthVp ?? 0;
+    const height = windowState.windowHeightVp ?? 0;
+    if (width <= 0 || height <= 0) {
+      return false;
+    }
+    return height >= width || width < DESKTOP_CHROME_MIN_WIDTH_VP;
   }
 
   private static resolveWindowPolicy(identity: DeviceIdentity, windowState?: WindowStateSnapshot): WindowPolicy {

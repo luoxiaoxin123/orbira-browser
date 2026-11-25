@@ -26,6 +26,7 @@ import { WebWindow, PictureInPictureSurface } from 'engine';
 import { MobileBrowserOverlay, TOP_BAR_EXTENT_VP, CHROME_DOCK_EXTENT_VP, CHROME_DOCK_FLOAT_MARGIN_VP, dockCoveredHeightVp } from '../components/mobile/MobileBrowserOverlay';
 import { SitePromptOverlays } from '../components/mobile/SitePromptOverlays';
 import { MobileBackRouter } from '../components/mobile/MobileBackRouter';
+import { DesktopBrowserChrome } from '../components/desktop/DesktopBrowserChrome';
 import { HomeSurface } from '../components/mobile/HomeSurface';
 import { CurrentTabCastSession } from '../components/mobile/CurrentTabCastSession';
 import {
@@ -257,6 +258,11 @@ struct AuraShell {
   // 内距必须换成它——setViewportInsets 是替换式，留着 dock 的值会把键盘 inset
   // 盖掉，页内固定底栏（评论输入条等）会跑到键盘后面被遮。
   @StorageLink('auraKeyboardVp') @Watch('onKeyboardVpChanged') keyboardVpForInset: number = 0;
+  // 桌面 chrome 自报的总高（vp）：DesktopBrowserChrome 挂载、收起页内查找条、
+  // 安全区变化时更新；@Watch 把新 inset 下发给引擎（sendBrowserControls 的
+  // top），让网页视口始终精确落在工具栏之下。
+  @StorageLink('auraDesktopChromeInset') @Watch('onDesktopChromeInsetChanged')
+  private desktopChromeInset: number = 0;
   @StorageLink('auraThemeFontId') themeFontId: string = '';
   @StorageLink('auraThemeFontRevision') themeFontRevision: number = 0;
   @StorageLink('auraOnboardingReady') onboardingReady: boolean = false;
@@ -422,6 +428,9 @@ struct AuraShell {
       // 供 WebWindow 在导航前推导桌面 UA、设置面板展示/管理。
       ShellUiPrefs.loadDesktopSites(context).then((list: string[]): void => {
         AppStorage.setOrCreate('auraDesktopSites', ShellUiPrefs.joinUrlList(list));
+        // 名单就绪标记：refreshUaDefaultEffective 的即时重推以它为闸，
+        // 避免偏好未加载完时拿空名单把引擎侧的 host 表冲掉。
+        this.desktopPrefsReady = true;
       });
       // 单站「回到移动版」例外名单：与桌面站名单同路持久化，启动期灌进 AppStorage，
       // 供 WebWindow 导航前推导 UA、菜单切换时增删。
@@ -430,6 +439,12 @@ struct AuraShell {
       });
       ShellUiPrefs.loadUaDefault(context).then((value: string): void => {
         AppStorage.setOrCreate('auraUaDefault', value);
+        this.refreshUaDefaultEffective();
+      });
+      // 读者是否亲手设置过全局 UA 默认：false 时平板/桌面家族按形态默认桌面版。
+      ShellUiPrefs.loadUaDefaultSet(context).then((value: boolean): void => {
+        AppStorage.setOrCreate('auraUaDefaultSet', value);
+        this.refreshUaDefaultEffective();
       });
     }
     // 冷启动预热（见 navCover 注释）。
@@ -985,6 +1000,24 @@ struct AuraShell {
       });
       return;
     }
+    if (!this.isMobilePhoneUi()) {
+      // 平板/桌面 chrome：常驻、不随滚动收起。top 把网页视口压到工具栏之下，
+      // chrome 自己叠在同区自绘（DesktopBrowserChrome 把实际高度写进
+      // auraDesktopChromeInset，含状态栏余量与可选的页内查找条）。
+      const top: number = Number(AppStorage.get('auraDesktopChromeInset') ?? 0);
+      this.executeBrowserCommand({
+        command: 'setBrowserControls',
+        top: top,
+        minTop: top,
+        bottom: 0
+      });
+      this.executeBrowserCommand({
+        command: 'setBrowserControlsState',
+        state: 'shown',
+        animate: false
+      });
+      return;
+    }
     const topSafe = Number(AppStorage.get('auraTopSafeVp') ?? 0);
     if (this.homeStyle === 'chrome') {
       if (this.dockPosition === 'top') {
@@ -1084,6 +1117,13 @@ struct AuraShell {
     this.applyDockViewportInset();
   }
 
+  private onDesktopChromeInsetChanged(): void {
+    // 无条件重发：桌面挂载时下发新的 top；退回手机时该键被清零，重发走回
+    // 手机分支的几何（同值重发幂等，引擎按值去重）。
+    this.sendBrowserControls();
+    this.applyDockViewportInset();
+  }
+
   private lastTopPushSent: number = -1;
 
   private topBarPushVp(): number {
@@ -1116,6 +1156,16 @@ struct AuraShell {
     }
     const bottomSafe = Number(AppStorage.get('auraBottomSafeVp') ?? 0);
     const topSafe = Number(AppStorage.get('auraTopSafeVp') ?? 0);
+    if (!this.isMobilePhoneUi()) {
+      // 桌面 chrome 没有底部 dock；键盘弹起时底部内距仍要按键盘高让位。
+      const desktopKeyboardVp: number = Number(AppStorage.get('auraKeyboardVp') ?? 0);
+      this.lastTopPushSent = 0;
+      this.executeBrowserCommand({
+        command: 'setViewportInsets',
+        bottom: desktopKeyboardVp > 0 ? desktopKeyboardVp + KEYBOARD_INSET_EXTRA_VP : 0
+      });
+      return;
+    }
     // 与 ratio 事件同步一次标志（幂等）：设置类变更路径直接调用本函数时，
     // 也把标志刷新到当前模式。
     this.topBarHiddenForInset = this.computeTopBarHiddenForInset();
@@ -1827,6 +1877,8 @@ struct AuraShell {
           const prevUrl: string = this.browserState.url;
           const prevTabIndex: number = this.browserState.activeTabIndex ?? -1;
           this.browserState = state;
+          // uiFamily 可能在这次状态里翻转（旋转/自由窗），重算派生默认 UA。
+          this.refreshUaDefaultEffective();
           // 换页/换标签：解除上一页的顶栏常显档，别把「关了隐藏开关」带到新页。
           // @Watch 会把内距、dock 与 browser controls 整套重算回 1.1.9。
           const pageChanged: boolean = (state.url ?? '') !== prevUrl ||
@@ -1994,6 +2046,23 @@ struct AuraShell {
           // 主页层在场时一律不叠：这块盖在主页之上，会叠出整屏蒙白。
           this.NavCoverView()
         }
+        // 平板/桌面主页：同一个 HomeSurface 以嵌入态复用（内容顶距 = chrome
+        // 总高），新标签页时盖住引擎原生 NTP。常驻挂载、Visibility 控制显隐，
+        // 与手机同款（避免回主页时重建 + 重解码壁纸的空帧）。
+        if (this.isDesktopAuraUi()) {
+          HomeSurface({
+            embedded: true,
+            topInsetVp: this.desktopChromeInset,
+            homeVisible: this.isNewTabPage(),
+            incognito: this.incognito,
+            onCommand: (command: BrowserCommandPayload): void => {
+              this.executeBrowserCommand(command);
+            }
+          })
+            .width('100%')
+            .height('100%')
+            .visibility(this.isNewTabPage() ? Visibility.Visible : Visibility.None)
+        }
         if (this.discardedCover) {
           this.DiscardedCoverView()
         }
@@ -2073,6 +2142,51 @@ struct AuraShell {
             onAnswer: this.sitePromptAnswer,
             onResolved: this.sitePromptResolved
           })
+        }
+        // 平板/桌面 chrome（aura_tablet / aura_pc）：标签条+工具栏+地址栏由
+        // DesktopBrowserChrome 自绘，叠在页面之上；网页视口由
+        // sendBrowserControls 的 top 内距压到工具栏之下（与手机同一套
+        // setBrowserControls 机制）。放在辅助窗口层之下：引擎弹出的原生
+        // 浮窗（扩展 popup 等）仍在最上层。
+        if (this.isDesktopAuraUi() && this.addressEditing) {
+          // 地址栏编辑态：垫一层全窗透明拦截。点网页区（TextInput 的 onBlur
+          // 对 XComponent 不生效）先把编辑态收掉——Chrome 点外侧退出的行为。
+          // 渲染在 DesktopBrowserChrome 之前，z 序在 chrome 之下，不挡工具栏。
+          Row()
+            .width('100%')
+            .height('100%')
+            .backgroundColor(Color.Transparent)
+            .onClick((): void => {
+              this.addressEditing = false;
+            })
+        }
+        if (this.isDesktopAuraUi()) {
+          DesktopBrowserChrome({
+            browserState: this.browserState,
+            incognito: this.incognito,
+            onCommand: (command: BrowserCommandPayload): void => {
+              // 与手机同一约定：返回键先问页面（弹层/全屏页优先处理），
+              // 页面不管才落到标签历史回退。
+              if (command.command === 'back') {
+                this.executeBrowserCommand({
+                  command: 'handleBack', requestId: ++this.backRequestId });
+                return;
+              }
+              // 主页键：尊重「启动页=自定义网址」设置（与手机 overlay 同分支）。
+              if (command.command === 'home') {
+                const startupPage: string = (AppStorage.get('auraStartupPage') as string) ?? 'builtin';
+                const customHome: string = (AppStorage.get('auraHomeUrl') as string) ?? '';
+                if (startupPage === 'homeUrl' && customHome.length > 0) {
+                  this.executeBrowserCommand({ command: 'navigate', url: customHome });
+                  return;
+                }
+              }
+              this.executeBrowserCommand(command);
+            }
+          })
+            // 顶层 Stack 的 alignContent 是 Bottom，.align 对自定义组件不生效，
+            // chrome 会整列掉到底部——用 position 钉在窗口左上角才稳。
+            .position({ x: 0, y: 0 })
         }
         if (this.auxiliaryWindows.length > 0) {
           this.AuxiliaryWindowLayer()
@@ -3451,6 +3565,46 @@ struct AuraShell {
 
   private desktopSitesSynced: boolean = false;
 
+  // 「全局默认桌面版」的派生开关：读者在设置里亲手设过（auraUaDefaultSet）
+  // 就以 'auraUaDefault' 为准；没设过时平板/桌面家族（uiFamily =
+  // aura_tablet/aura_pc，横屏大窗）按形态默认桌面版，手机家族默认手机版。
+  // 结果发布到 'auraUaDefaultEffective'，WebWindow 导航注入、菜单切换、
+  // 设置页展示都读它而不是原始 pref——单一推导点。
+  @StorageLink('auraUaDefault') @Watch('refreshUaDefaultEffective')
+  private uaDefaultPref: string = 'mobile';
+  @StorageLink('auraUaDefaultSet') @Watch('refreshUaDefaultEffective')
+  private uaDefaultSet: boolean = false;
+
+  private uaDefaultIsDesktop(): boolean {
+    if (this.uaDefaultSet) {
+      return this.uaDefaultPref === 'desktop';
+    }
+    const family: string = this.browserState.uiFamily ?? '';
+    return this.uaDefaultPref === 'desktop' ||
+      family === 'aura_tablet' || family === 'aura_pc';
+  }
+
+  // 名单偏好是否已从 disk 读出（刷新重推只在此后置行，否则等 syncDesktopSites）。
+  private desktopPrefsReady: boolean = false;
+
+  private refreshUaDefaultEffective(): void {
+    const next: string = this.uaDefaultIsDesktop() ? 'desktop' : 'mobile';
+    if (String(AppStorage.get('auraUaDefaultEffective') ?? '') === next) {
+      return;
+    }
+    AppStorage.setOrCreate('auraUaDefaultEffective', next);
+    // 全局档翻转立刻推给引擎：everywhere 标志不进下次导航不生效，旋转/自由窗
+    // 切换时不能等下一跳。名单偏好没读完先只发键，让 syncDesktopSites 兜底。
+    if (this.desktopPrefsReady) {
+      this.executeBrowserCommand({
+        command: 'setDesktopSites',
+        sites: String(AppStorage.get('auraDesktopSites') ?? ''),
+        allSites: next === 'desktop',
+        mobileSites: String(AppStorage.get('auraMobileSites') ?? '')
+      });
+    }
+  }
+
   private syncDesktopSites(): void {
     // 只在启动时跑一轮：onBrowserState 每次状态更新都会进 ready 分支，
     // 不加闸门会不断重排重试，形成命令洪水（页面反复加载、脚本卡死）。
@@ -3460,8 +3614,7 @@ struct AuraShell {
       return;
     }
     const sites: string = String(AppStorage.get('auraDesktopSites') ?? '');
-    const allSites: boolean =
-      String(AppStorage.get('auraUaDefault') ?? 'mobile') === 'desktop';
+    const allSites: boolean = this.uaDefaultIsDesktop();
     // 不在这里 return：名单是异步从 preferences 读进来的，第一次调用时可能还是
     // 空的。始终留着重试，等它读出来再送一次。
     if (sites.length > 0 || allSites) {

@@ -318,6 +318,8 @@ export struct SettingsPanel {
   // 「桌面版网站」：全局 UA 默认（'mobile' | 'desktop'）与站点名单
   // （\n 分隔的 host）。两者决定 WebWindow 是否在该站点用桌面形状 UA。
   @StorageLink('auraUaDefault') uaDefault: string = 'mobile';
+  // 派生值（AuraShell 发布）：平板/桌面家族未亲手设过开关时按形态默认 desktop。
+  @StorageLink('auraUaDefaultEffective') uaDefaultEffective: string = '';
   @StorageLink('auraDesktopSites') desktopSitesRaw: string = '';
   private desktopSitesScroller: Scroller = new Scroller();
   private requestSeq: number = 0;
@@ -1480,13 +1482,19 @@ export struct SettingsPanel {
                 }
               })
             this.CardDivider()
+            // 展示与下发都用派生键：平板/桌面家族在读者没亲手碰过开关时
+            // 按形态默认桌面版（isOn 显示为开）；亲手拨动后写显式标志，
+            // 之后永远以用户选择为准（横屏平板也能明确关回手机默认）。
             this.ShellToggleRow($r('app.media.aura_desktop'), '默认使用桌面版网站', '所有网站以桌面版打开',
-              this.uaDefault === 'desktop', (isOn: boolean): void => {
+              (this.uaDefaultEffective || this.uaDefault) === 'desktop', (isOn: boolean): void => {
                 const value: string = isOn ? 'desktop' : 'mobile';
                 AppStorage.setOrCreate('auraUaDefault', value);
+                AppStorage.setOrCreate('auraUaDefaultSet', true);
+                AppStorage.setOrCreate('auraUaDefaultEffective', value);
                 const ctx = this.getUIContext().getHostContext() as common.Context | undefined;
                 if (ctx) {
                   ShellUiPrefs.saveUaDefault(ctx, value);
+                  ShellUiPrefs.saveUaDefaultSet(ctx, true);
                 }
                 // 立即作用于当前标签：切换 UA 后重载，与桌面版开关的原生行为一致。
                 this.onCommand({

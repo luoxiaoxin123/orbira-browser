@@ -139,6 +139,7 @@ export struct WebWindow {
   private componentHeightPx: number = 0;
   private focusRecoveryTimers: number[] = [];
   private rotationSyncTimer: number = -1;
+  private boundsSettleTimer: number = -1;
   private lastExecutedBrowserCommandRevision: number = 0;
   // For commands from a BrowserCommandChannel: which channel, and the last
   // command of it run. See BrowserCommandChannel.
@@ -732,6 +733,7 @@ export struct WebWindow {
               this.rotationSyncTimer = -1;
               this.configureSurfaceRotation();
               this.notifyCurrentBounds();
+              this.scheduleBoundsSettle();
             }, 0);
           });
         } catch (error) {
@@ -803,6 +805,10 @@ export struct WebWindow {
     if (this.rotationSyncTimer >= 0) {
       clearTimeout(this.rotationSyncTimer);
       this.rotationSyncTimer = -1;
+    }
+    if (this.boundsSettleTimer >= 0) {
+      clearTimeout(this.boundsSettleTimer);
+      this.boundsSettleTimer = -1;
     }
 
     this.activeWindow = null;
@@ -900,6 +906,7 @@ export struct WebWindow {
           Number(properties.windowRect.top),
           Number(size.width),
           Number(size.height)));
+        this.scheduleBoundsSettle();
         return;
       } catch (error) {
       }
@@ -911,6 +918,7 @@ export struct WebWindow {
       width: size.width,
       height: size.height
     });
+    this.scheduleBoundsSettle();
   }
 
   private handleWindowRectChange(options: window.RectChangeOptions): void {
@@ -926,6 +934,22 @@ export struct WebWindow {
       Number(options.rect.top),
       Number(options.rect.width),
       Number(options.rect.height)));
+    this.scheduleBoundsSettle();
+  }
+
+  // The rect reported right at a window size/rotation event can still carry
+  // the old orientation's component size -- onAreaChange lands a layout pass
+  // later. Re-report once the layout has settled so the surface always ends
+  // at the real bounds; a missed pass once left the page stretched until the
+  // app was restarted.
+  private scheduleBoundsSettle(): void {
+    if (this.boundsSettleTimer >= 0) {
+      clearTimeout(this.boundsSettleTimer);
+    }
+    this.boundsSettleTimer = setTimeout((): void => {
+      this.boundsSettleTimer = -1;
+      this.notifyCurrentBounds();
+    }, 150);
   }
 
   private handleWindowEvent(event: window.WindowEventType): void {
@@ -1054,6 +1078,13 @@ export struct WebWindow {
 
   private updateSurfaceRect(rect: WindowRect): void {
     if (!this.nativeContext) {
+      return;
+    }
+    // A mid-rotation rect can report a zero size while the window manager
+    // swaps orientations (WMSLayout: "width or height should greater than
+    // 0"). Zeroing the surface kills it; the settle pass follows with the
+    // real bounds anyway, so the transient one is just dropped.
+    if (rect.width <= 0 || rect.height <= 0) {
       return;
     }
 
@@ -1571,7 +1602,10 @@ export struct WebWindow {
         }
       }
     }
-    const def = String(AppStorage.get('auraUaDefault') ?? 'mobile');
+    // 派生键优先：平板/桌面家族在读者没亲手设过开关时按形态默认桌面版
+    // （AuraShell.refreshUaDefaultEffective 发布，见 auraUaDefaultSet）。
+    const def = String(AppStorage.get('auraUaDefaultEffective') ??
+      AppStorage.get('auraUaDefault') ?? 'mobile');
     if (def === 'desktop') {
       return true;
     }
@@ -1703,7 +1737,8 @@ export struct WebWindow {
           out.push({
             command: 'setDesktopSites',
             sites: String(AppStorage.get('auraDesktopSites') ?? ''),
-            allSites: String(AppStorage.get('auraUaDefault') ?? 'mobile') === 'desktop',
+            allSites: String(AppStorage.get('auraUaDefaultEffective') ??
+              AppStorage.get('auraUaDefault') ?? 'mobile') === 'desktop',
             mobileSites: String(AppStorage.get('auraMobileSites') ?? '')
           });
         }
